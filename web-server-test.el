@@ -344,4 +344,251 @@ Content-Type: application/octet-stream
     (gzipper "Content-Encoding")
     (gzipper "Transfer-Encoding")))
 
+;;; Deferred buffered responses
+
+;; Contract: a handler may call `ws-defer' and return.  The connection
+;; then stays open with one pending `ws-responder' until exactly one
+;; terminal event wins: `ws-respond' (completed), `ws-responder-abort'
+;; (aborted), client disconnect (disconnected), extra input beyond the
+;; declared bound (overflow), a handler error after deferral (failed) or
+;; `ws-stop' (stopped).  The winner releases the request and the socket
+;; once and calls ON-CLOSE once; every later attempt returns nil.  A
+;; deferred reply is buffered and the connection closes after it: no
+;; keep-alive and no second handler on the same connection.
+
+(defun ws-test-deferred--port (server)
+  "Return the port SERVER actually listens on."
+  (process-contact (ws-process server) :service))
+
+(defun ws-test-deferred--wait (pred &optional seconds)
+  "Process events until PRED is non-nil or SECONDS (default 5) elapse.
+Return PRED's final value; never depends on a fixed sleep."
+  (let ((deadline (+ (float-time) (or seconds 5)))
+        (value nil))
+    (while (and (not (setq value (funcall pred)))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.05))
+    value))
+
+(defun ws-test-deferred--client (port &optional text)
+  "Open a raw client to PORT, send TEXT, and return the client process.
+The process plist :output accumulates every received byte."
+  (let ((proc (open-network-stream "ws-test-deferred-client" nil
+                                   "127.0.0.1" port)))
+    (set-process-coding-system proc 'binary 'binary)
+    (set-process-query-on-exit-flag proc nil)
+    (process-put proc :output "")
+    (set-process-filter proc (lambda (p s)
+                               (process-put p :output
+                                            (concat (process-get p :output) s))))
+    (set-process-sentinel proc #'ignore)
+    (when text (process-send-string proc text))
+    proc))
+
+(defun ws-test-deferred--get (path)
+  "Return a minimal HTTP/1.1 GET request for PATH."
+  (format "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" path))
+
+(defmacro ws-test-deferred--with (handler var &rest body)
+  "Run BODY with server VAR serving HANDLER on an ephemeral port."
+  (declare (indent 2))
+  `(let ((,var (ws-start ,handler 0)))
+     (unwind-protect (progn ,@body)
+       (when (memq ,var ws-servers) (ws-stop ,var)))))
+
+(defun ws-test-deferred--handlers (state)
+  "Return handlers recording into the plist cell STATE.
+/defer defers and stores the responder; /sync replies synchronously;
+/fail defers and then signals."
+  `(((:GET . "^/defer") .
+     ,(lambda (request)
+        (setcar state (plist-put (car state) :calls
+                                 (1+ (or (plist-get (car state) :calls) 0))))
+        (setcar state
+                (plist-put (car state) :responder
+                           (ws-defer request
+                                     :input-limit 64
+                                     :on-close
+                                     (lambda (_r reason)
+                                       (setcar state
+                                               (plist-put (car state) :closed
+                                                          (cons reason (plist-get (car state) :closed))))))))
+        nil))
+    ((:GET . "^/sync") .
+     ,(lambda (request)
+        (ws-response-header (ws-process request) 200
+                            '("Content-type" . "text/plain"))
+        (process-send-string (ws-process request) "sync")))
+    ((:GET . "^/fail") .
+     ,(lambda (request)
+        (setcar state
+                (plist-put (car state) :responder
+                           (ws-defer request
+                                     :on-close
+                                     (lambda (_r reason)
+                                       (setcar state
+                                               (plist-put (car state) :closed
+                                                          (cons reason (plist-get (car state) :closed))))))))
+        (error "Handler failed after deferral")))))
+
+(ert-deftest ws/deferred-returns-and-completes-once ()
+  "A deferred handler returns to the event loop; completion wins once."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let* ((port (ws-test-deferred--port server))
+             (a (ws-test-deferred--client port (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+        (let ((responder (plist-get (car state) :responder)))
+          (should (eq 'pending (ws-responder-state responder)))
+          ;; Another connection is served while A is still pending.
+          (let ((b (ws-test-deferred--client port (ws-test-deferred--get "/sync"))))
+            (should (ws-test-deferred--wait (lambda () (not (process-live-p b)))))
+            (should (string-match-p "\r\n\r\nsync\\'" (process-get b :output))))
+          (should (equal "" (process-get a :output)))
+          (should (process-live-p a))
+          ;; Completion: one buffered reply, then close and release.
+          (should (eq t (ws-respond responder 200 '(("Content-type" . "text/plain"))
+                                    "done")))
+          (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+          (should (string-match-p "\\`HTTP/1.1 200 OK\r\n" (process-get a :output)))
+          (should (string-match-p "\r\n\r\ndone\\'" (process-get a :output)))
+          (should (eq 'completed (ws-responder-state responder)))
+          (should (null (ws-requests server)))
+          (should (equal '(completed) (plist-get (car state) :closed)))
+          ;; Every later terminal attempt loses and changes nothing.
+          (should (null (ws-respond responder 200 nil "again")))
+          (should (null (ws-responder-abort responder)))
+          (should (equal '(completed) (plist-get (car state) :closed)))
+          (should (= 1 (plist-get (car state) :calls))))))))
+
+(ert-deftest ws/deferred-extra-input-within-bound-runs-no-second-handler ()
+  "Extra bytes within the bound are held; a second handler never runs."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+        (process-send-string a "GET /defer HTTP/1.1\r\n\r\n") ; 24 bytes < 64
+        (ws-test-deferred--wait (lambda () nil) 0.3)
+        (should (process-live-p a))
+        (should (= 1 (plist-get (car state) :calls)))
+        (should (eq t (ws-respond (plist-get (car state) :responder) 200 nil "one")))
+        (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+        (should (= 1 (with-temp-buffer
+                       (insert (process-get a :output))
+                       (count-matches "HTTP/1.1 200" (point-min) (point-max)))))
+        (should (= 1 (plist-get (car state) :calls)))))))
+
+(ert-deftest ws/deferred-extra-input-beyond-bound-closes-once ()
+  "Input beyond the declared bound closes the connection as overflow."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+        (process-send-string a (make-string 200 ?x))
+        (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+        (let ((responder (plist-get (car state) :responder)))
+          (should (eq 'overflow (ws-responder-state responder)))
+          (should (equal '(overflow) (plist-get (car state) :closed)))
+          (should (null (ws-requests server)))
+          (should (null (ws-respond responder 200 nil "late")))
+          (should (equal "" (process-get a :output)))
+          (should (= 1 (plist-get (car state) :calls))))))))
+
+(ert-deftest ws/deferred-disconnect-reconciles-once ()
+  "A client disconnect releases the request once; late completion loses."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+        (delete-process a)
+        (let ((responder (plist-get (car state) :responder)))
+          (should (ws-test-deferred--wait
+                   (lambda () (eq 'disconnected (ws-responder-state responder)))))
+          (should (null (ws-requests server)))
+          (should (equal '(disconnected) (plist-get (car state) :closed)))
+          (should (null (ws-respond responder 200 nil "late")))
+          (should (null (ws-responder-abort responder)))
+          (should (equal '(disconnected) (plist-get (car state) :closed))))))))
+
+(ert-deftest ws/deferred-stop-reconciles-once ()
+  "`ws-stop' with a pending responder ends it once as stopped."
+  (let* ((state (list nil))
+         (server (ws-start (ws-test-deferred--handlers state) 0)))
+    (unwind-protect
+        (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                           (ws-test-deferred--get "/defer"))))
+          (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+          (ws-stop server)
+          (let ((responder (plist-get (car state) :responder)))
+            (ws-test-deferred--wait (lambda () (not (process-live-p a))))
+            (should (eq 'stopped (ws-responder-state responder)))
+            (should (equal '(stopped) (plist-get (car state) :closed)))
+            (should (null (ws-respond responder 200 nil "late")))
+            (should (equal '(stopped) (plist-get (car state) :closed)))))
+      (when (memq server ws-servers) (ws-stop server)))))
+
+(ert-deftest ws/deferred-handler-failure-ends-once ()
+  "A handler error after deferral answers 500 and ends the responder once."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/fail"))))
+        (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+        (should (string-match-p "\\`HTTP/1.1 500" (process-get a :output)))
+        (let ((responder (plist-get (car state) :responder)))
+          (should (eq 'failed (ws-responder-state responder)))
+          (should (equal '(failed) (plist-get (car state) :closed)))
+          (should (null (ws-requests server)))
+          (should (null (ws-respond responder 200 nil "late"))))))))
+
+(ert-deftest ws/deferred-abort-closes-without-reply ()
+  "`ws-responder-abort' closes with no reply bytes and wins once."
+  (let ((state (list nil)))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+        (let ((responder (plist-get (car state) :responder)))
+          (should (eq t (ws-responder-abort responder)))
+          (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+          (should (equal "" (process-get a :output)))
+          (should (eq 'aborted (ws-responder-state responder)))
+          (should (equal '(aborted) (plist-get (car state) :closed)))
+          (should (null (ws-requests server)))
+          (should (null (ws-respond responder 200 nil "late"))))))))
+
+(ert-deftest ws/deferred-on-close-error-is-contained ()
+  "An error in ON-CLOSE never escapes completion, a filter or a sentinel."
+  (let ((responder nil))
+    (ws-test-deferred--with
+        (lambda (request)
+          (setq responder (ws-defer request :on-close
+                                    (lambda (&rest _) (error "on-close exploded"))))
+          nil)
+        server
+      (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                         (ws-test-deferred--get "/x"))))
+        (should (ws-test-deferred--wait (lambda () responder)))
+        (should (eq t (ws-respond responder 200 nil "ok")))
+        (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+        (should (eq 'completed (ws-responder-state responder)))
+        (should (null (ws-requests server)))))))
+
+(ert-deftest ws/synchronous-handler-unchanged-raw ()
+  "A synchronous handler still replies and closes with no responder."
+  (ws-test-deferred--with
+      (lambda (request)
+        (ws-response-header (ws-process request) 200
+                            '("Content-type" . "text/plain"))
+        (process-send-string (ws-process request) "plain"))
+      server
+    (let ((a (ws-test-deferred--client (ws-test-deferred--port server)
+                                       (ws-test-deferred--get "/"))))
+      (should (ws-test-deferred--wait (lambda () (not (process-live-p a)))))
+      (should (string-match-p "\r\n\r\nplain\\'" (process-get a :output)))
+      (should (null (ws-requests server))))))
+
 (provide 'web-server-test)
