@@ -63,7 +63,23 @@
    (index    :initarg :index    :accessor ws-index    :initform 0)
    (active   :initarg :active   :accessor ws-active   :initform nil)
    (headers  :initarg :headers  :accessor ws-headers  :initform (list nil))
-   (body     :initarg :body     :accessor ws-body     :initform "")))
+   (body     :initarg :body     :accessor ws-body     :initform "")
+   (responder :initarg :responder :accessor ws-request-responder
+              :initform nil)))
+
+(defvar ws-deferred-input-limit 8192
+  "Default bound on bytes accepted after a request is deferred.
+Bytes received on a deferred connection after `ws-defer' are counted
+against this bound and discarded; exceeding it closes the connection.")
+
+(defclass ws-responder ()
+  ((request     :initarg :request :accessor ws-responder-request)
+   (state       :initform 'pending :accessor ws-responder-state)
+   (on-close    :initarg :on-close :initform nil)
+   (input-limit :initarg :input-limit :initform nil)
+   (input-bytes :initform 0 :accessor ws-responder-input-bytes))
+  "One pending buffered reply for a deferred request.
+See `ws-defer'.")
 
 (defvar ws-servers nil
   "List holding all web servers.")
@@ -143,8 +159,14 @@ function.
     server))
 
 (defun ws-stop (server)
-  "Stop SERVER."
+  "Stop SERVER.
+Pending deferred responders end as `stopped' before their connections
+are deleted."
   (setq ws-servers (remove server ws-servers))
+  (dolist (request (copy-sequence (ws-requests server)))
+    (let ((responder (ws-request-responder request)))
+      (when responder
+        (ws--responder-finish responder 'stopped))))
   (mapc #'delete-process (append (mapcar #'ws-process (ws-requests server))
                                  (list (ws-process server)))))
 
@@ -228,20 +250,124 @@ function.
   (with-slots (handlers requests) (plist-get (process-plist proc) :server)
     (unless (cl-find-if (lambda (c) (equal proc (ws-process c))) requests)
       (push (make-instance 'ws-request :process proc) requests))
-    (let ((request (cl-find-if (lambda (c) (equal proc (ws-process c))) requests)))
-      (with-slots (pending) request (setq pending (concat pending string)))
-      (unless (ws-active request) ; don't re-start if request is being parsed
-        (setf (ws-active request) t)
-        (when (not (eq (catch 'close-connection
-                         (if (ws-parse-request request)
-                             (ws-call-handler request handlers)
-                           :keep-alive))
-                       :keep-alive))
-          ;; Properly shut down processes requiring an ending (e.g., chunked)
-          (let ((ender (plist-get (process-plist proc) :ender)))
-            (when ender (process-send-string proc ender)))
-          (setq requests (cl-remove-if (lambda (r) (eql proc (ws-process r))) requests))
-          (delete-process proc))))))
+    (let* ((request (cl-find-if (lambda (c) (equal proc (ws-process c))) requests))
+           (responder (ws-request-responder request)))
+      (if (and responder (eq (ws-responder-state responder) 'pending))
+          ;; Deferred: later input is counted against the bound and
+          ;; discarded; it never reaches pending or a second handler.
+          (ws--deferred-input responder string)
+        (with-slots (pending) request (setq pending (concat pending string)))
+        (unless (ws-active request) ; don't re-start if request is being parsed
+          (setf (ws-active request) t)
+          (let* ((thrown t)
+                 (result (catch 'close-connection
+                           (prog1 (if (ws-parse-request request)
+                                      (ws-call-handler request handlers)
+                                    :keep-alive)
+                             (setq thrown nil))))
+                 (responder (ws-request-responder request)))
+            (cond
+             ;; A handler error after deferral: the 500 has been sent.
+             ((and thrown responder)
+              (ws--responder-finish responder 'failed))
+             ;; The handler deferred: keep the connection for `ws-respond'.
+             (responder nil)
+             ((eq result :keep-alive) nil)
+             (t
+              ;; Properly shut down processes requiring an ending (e.g., chunked)
+              (let ((ender (plist-get (process-plist proc) :ender)))
+                (when ender (process-send-string proc ender)))
+              (setq requests (cl-remove-if (lambda (r) (eql proc (ws-process r))) requests))
+              (delete-process proc)))))))))
+
+;;; Deferred buffered responses
+
+(cl-defun ws-defer (request &key on-close (input-limit ws-deferred-input-limit))
+  "Defer the reply to REQUEST and return its `ws-responder'.
+Call this from a handler, then return.  The connection stays open until
+exactly one terminal event wins: `ws-respond' (completed, or failed when
+the reply cannot be written), `ws-responder-abort' (aborted), a client
+disconnect (disconnected), more than INPUT-LIMIT bytes received after
+deferral (overflow), a handler error after deferral (failed) or
+`ws-stop' (stopped).  The winner releases the request and the connection
+once and calls ON-CLOSE, a function of (RESPONDER REASON), exactly once;
+errors in ON-CLOSE are caught and logged.  The reply is buffered and the
+connection closes after it: there is no keep-alive and no second handler
+on a deferred connection."
+  (when (ws-request-responder request)
+    (error "ws-defer: request is already deferred"))
+  (let ((responder (make-instance 'ws-responder
+                                  :request request
+                                  :on-close on-close
+                                  :input-limit input-limit)))
+    (setf (ws-request-responder request) responder)
+    (set-process-sentinel (ws-process request) #'ws--deferred-sentinel)
+    responder))
+
+(defun ws--responder-finish (responder reason)
+  "End pending RESPONDER with REASON once.
+Release its request and connection and call its ON-CLOSE.  Return t when
+this call made the transition, nil when RESPONDER had already ended."
+  (when (eq (ws-responder-state responder) 'pending)
+    (setf (ws-responder-state responder) reason)
+    (let* ((request (ws-responder-request responder))
+           (proc (ws-process request))
+           (server (plist-get (process-plist proc) :server)))
+      (when server
+        (setf (ws-requests server) (delq request (ws-requests server))))
+      (when (process-live-p proc)
+        (set-process-sentinel proc #'ignore)
+        (delete-process proc)))
+    (let ((on-close (slot-value responder 'on-close)))
+      (when on-close
+        (condition-case err
+            (funcall on-close responder reason)
+          (error (message "ws-responder: on-close error: %S" err)))))
+    t))
+
+(defun ws--deferred-input (responder string)
+  "Count STRING against pending RESPONDER's input bound and discard it."
+  (let ((total (+ (ws-responder-input-bytes responder) (length string))))
+    (setf (ws-responder-input-bytes responder) total)
+    (when (> total (slot-value responder 'input-limit))
+      (ws--responder-finish responder 'overflow))))
+
+(defun ws--deferred-sentinel (proc _event)
+  "End a pending deferred responder on PROC when its connection closes."
+  (unless (process-live-p proc)
+    (let* ((server (plist-get (process-plist proc) :server))
+           (request (and server
+                         (cl-find-if (lambda (r) (eq proc (ws-process r)))
+                                     (ws-requests server))))
+           (responder (and request (ws-request-responder request))))
+      (when responder
+        (ws--responder-finish responder 'disconnected)))))
+
+(defun ws-respond (responder code headers body)
+  "Send one buffered reply for pending RESPONDER, then close.
+Send status CODE with HEADERS, an alist, and BODY through
+`ws-response-header' and `ws-send'.  Return t when the reply was written
+and RESPONDER completed.  Return nil, without signalling, when RESPONDER
+had already ended or the reply could not be written, which ends it as
+`failed'."
+  (when (eq (ws-responder-state responder) 'pending)
+    (let ((proc (ws-process (ws-responder-request responder))))
+      (if (condition-case nil
+              (progn
+                (apply #'ws-response-header proc code headers)
+                (when body (ws-send proc body))
+                (let ((ender (plist-get (process-plist proc) :ender)))
+                  (when ender (process-send-string proc ender)))
+                t)
+            (error nil))
+          (ws--responder-finish responder 'completed)
+        (ws--responder-finish responder 'failed)
+        nil))))
+
+(defun ws-responder-abort (responder)
+  "End pending RESPONDER without a reply and close its connection.
+Return t when this call ended it, nil when it had already ended."
+  (ws--responder-finish responder 'aborted))
 
 (defun ws-parse-request (request)
   "Parse request STRING from REQUEST with process PROC.

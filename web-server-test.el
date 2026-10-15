@@ -517,18 +517,31 @@ and never dispatches a second handler."
           (should (= 1 (ws-test-deferred--reply-count (process-get a :output))))
           (should (= 1 (plist-get (car state) :calls))))))))
 
+(defun ws-test-deferred--accepted-connection (server)
+  "Return SERVER's accepted connection process, once Emacs has accepted it."
+  (ws-test-deferred--wait
+   (lambda ()
+     (cl-find-if (lambda (p)
+                   (and (eq server (plist-get (process-plist p) :server))
+                        (not (eq p (ws-process server)))
+                        (process-live-p p)))
+                 (process-list)))))
+
 (ert-deftest ws/deferred-coalesced-input-belongs-to-the-request ()
-  "Bytes coalesced with the completing chunk are part of the request:
-one handler, no post-deferral input counted, one reply."
+  "Boundary control: bytes coalesced into the completing chunk belong to the
+request.  One chunk is fed deterministically through the real `ws-filter'
+on the owned accepted connection, so no packet split can change what the
+filter sees: one handler, no post-deferral input counted, one reply."
   (let ((state (list nil)))
     (ws-test-deferred--with (ws-test-deferred--handlers state) server
-      (let ((a (ws-test-deferred--client
-                (ws-test-deferred--port server)
-                (concat (ws-test-deferred--get "/defer")
-                        "GET /defer HTTP/1.1\r\n\r\n"))))
-        (should (ws-test-deferred--wait (lambda () (plist-get (car state) :responder))))
+      (let* ((a (ws-test-deferred--client (ws-test-deferred--port server)))
+             (conn (ws-test-deferred--accepted-connection server)))
+        (should conn)
+        (ws-filter conn (concat (ws-test-deferred--get "/defer")
+                                "GET /defer HTTP/1.1\r\n\r\n"))
         (let ((responder (plist-get (car state) :responder))
               (request (plist-get (car state) :request)))
+          (should responder)
           (should (= 0 (ws-responder-input-bytes responder)))
           (should (= (plist-get (car state) :pending-at-defer)
                      (length (ws-pending request))))
