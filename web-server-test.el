@@ -697,4 +697,88 @@ a filter or a sentinel."
       (should (string-match-p "\r\n\r\nplain\\'" (process-get a :output)))
       (should (null (ws-requests server))))))
 
+(defun ws-test-deferred--during-write (state action)
+  "Defer /defer, then run ACTION on the responder from the owned client's
+filter while an 8 MiB reply is being written.  Return a plist of what the
+outer `ws-respond', the reentrant ACTION and the client observed.
+The client's ordinary process filter is the reentry point, so no server
+primitive is replaced: `process-send-string' lets other process output run
+between write bunches."
+  (let ((writing nil)
+        (reentered nil)
+        (inner :unobserved)
+        (outer :unobserved))
+    (ws-test-deferred--with (ws-test-deferred--handlers state) server
+      (let ((client (ws-test-deferred--client
+                     (ws-test-deferred--port server)
+                     (ws-test-deferred--get "/defer"))))
+        (should (ws-test-deferred--wait
+                 (lambda () (plist-get (car state) :responder))))
+        (let* ((responder (plist-get (car state) :responder))
+               (original-filter (process-filter client)))
+          (set-process-filter
+           client
+           (lambda (proc text)
+             (funcall original-filter proc text)
+             (when (and writing (not reentered))
+               (setq reentered t
+                     inner (funcall action responder proc)))))
+          (setq writing t)
+          (setq outer (ws-respond responder 200 nil
+                                  (make-string (* 8 1024 1024) ?x)))
+          (setq writing nil)
+          (should reentered)
+          (should (ws-test-deferred--wait
+                   (lambda () (not (process-live-p client)))))
+          (list :inner inner :outer outer
+                :replies (ws-test-deferred--reply-count (process-get client :output))
+                :state (ws-responder-state responder)
+                :closed (plist-get (car state) :closed)
+                :requests (ws-requests server)))))))
+
+(ert-deftest ws/deferred-reentrant-completion-during-write-emits-one-response ()
+  "A completion attempted while the reply is being written writes nothing:
+one reply, the outer call wins, ON-CLOSE fires once."
+  (let* ((state (list nil))
+         (r (ws-test-deferred--during-write
+             state (lambda (responder _client)
+                     (ws-respond responder 200 nil "inner")))))
+    (should (null (plist-get r :inner)))
+    (should (eq t (plist-get r :outer)))
+    (should (= 1 (plist-get r :replies)))
+    (should (eq 'completed (plist-get r :state)))
+    (should (equal '(completed) (plist-get r :closed)))
+    (should (null (plist-get r :requests)))))
+
+(ert-deftest ws/deferred-abort-during-write-ends-once ()
+  "An abort while the reply is being written wins: the outer completion
+returns nil, cleanup and ON-CLOSE happen once, as aborted."
+  (let* ((state (list nil))
+         (r (ws-test-deferred--during-write
+             state (lambda (responder _client)
+                     (ws-responder-abort responder)))))
+    (should (eq t (plist-get r :inner)))
+    (should (null (plist-get r :outer)))
+    (should (eq 'aborted (plist-get r :state)))
+    (should (equal '(aborted) (plist-get r :closed)))
+    (should (null (plist-get r :requests)))))
+
+(ert-deftest ws/deferred-disconnect-during-write-ends-once ()
+  "A client disconnect while the reply is being written ends the responder
+exactly once.  Whichever terminal event the server observes first wins
+(the disconnect, a failed write, or completion when every byte was already
+written); the outer call returns t only when completion won."
+  (let* ((state (list nil))
+         (r (ws-test-deferred--during-write
+             state (lambda (_responder client)
+                     (delete-process client)
+                     :deleted))))
+    (should (eq :deleted (plist-get r :inner)))
+    (should (= 1 (length (plist-get r :closed))))
+    (should (memq (car (plist-get r :closed)) '(disconnected failed completed)))
+    (should (eq (eq t (plist-get r :outer))
+                (eq 'completed (car (plist-get r :closed)))))
+    (should (eq (car (plist-get r :closed)) (plist-get r :state)))
+    (should (null (plist-get r :requests)))))
+
 (provide 'web-server-test)

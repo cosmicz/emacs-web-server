@@ -252,9 +252,10 @@ are deleted."
       (push (make-instance 'ws-request :process proc) requests))
     (let* ((request (cl-find-if (lambda (c) (equal proc (ws-process c))) requests))
            (responder (ws-request-responder request)))
-      (if (and responder (eq (ws-responder-state responder) 'pending))
-          ;; Deferred: later input is counted against the bound and
-          ;; discarded; it never reaches pending or a second handler.
+      (if (and responder (ws--responder-open-p responder))
+          ;; Deferred (pending or writing its reply): later input is
+          ;; counted against the bound and discarded; it never reaches
+          ;; pending or a second handler.
           (ws--deferred-input responder string)
         (with-slots (pending) request (setq pending (concat pending string)))
         (unless (ws-active request) ; don't re-start if request is being parsed
@@ -293,7 +294,8 @@ deferral (overflow), a handler error after deferral (failed) or
 once and calls ON-CLOSE, a function of (RESPONDER REASON), exactly once;
 errors in ON-CLOSE are caught and logged.  The reply is buffered and the
 connection closes after it: there is no keep-alive and no second handler
-on a deferred connection."
+on a deferred connection.  While `ws-respond' writes the reply the
+responder's state is `responding'."
   (when (ws-request-responder request)
     (error "ws-defer: request is already deferred"))
   (let ((responder (make-instance 'ws-responder
@@ -304,11 +306,19 @@ on a deferred connection."
     (set-process-sentinel (ws-process request) #'ws--deferred-sentinel)
     responder))
 
+(defun ws--responder-open-p (responder)
+  "Return non-nil while RESPONDER has not reached a terminal state.
+It is open while `pending' and while `responding', that is while
+`ws-respond' holds the reply and is writing it."
+  (memq (ws-responder-state responder) '(pending responding)))
+
 (defun ws--responder-finish (responder reason)
-  "End pending RESPONDER with REASON once.
+  "End open RESPONDER with REASON once.
 Release its request and connection and call its ON-CLOSE.  Return t when
-this call made the transition, nil when RESPONDER had already ended."
-  (when (eq (ws-responder-state responder) 'pending)
+this call made the transition, nil when RESPONDER had already ended.
+An abort, disconnect, overflow or stop during an in-flight reply still
+ends it here, exactly once."
+  (when (ws--responder-open-p responder)
     (setf (ws-responder-state responder) reason)
     (let* ((request (ws-responder-request responder))
            (proc (ws-process request))
@@ -348,9 +358,16 @@ this call made the transition, nil when RESPONDER had already ended."
 Send status CODE with HEADERS, an alist, and BODY through
 `ws-response-header' and `ws-send'.  Return t when the reply was written
 and RESPONDER completed.  Return nil, without signalling, when RESPONDER
-had already ended or the reply could not be written, which ends it as
-`failed'."
+had already ended or was already replying, or when the reply could not be
+written, which ends it as `failed'.
+
+The reply is claimed before the first write: RESPONDER moves to
+`responding', so a completion attempted while bytes are being written
+(other process output may run between write bunches) writes nothing.
+An abort, disconnect, overflow or stop during the write still ends the
+responder once, and this call then returns nil."
   (when (eq (ws-responder-state responder) 'pending)
+    (setf (ws-responder-state responder) 'responding)
     (let ((proc (ws-process (ws-responder-request responder))))
       (if (condition-case nil
               (progn
