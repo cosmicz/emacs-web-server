@@ -147,7 +147,8 @@ function.
                           (when log (list :log-buffer log)))
            :log (when log
                   (lambda (proc request message)
-                    (let ((c (process-contact request))
+                    ;; Emacs passes a nil REQUEST when accept fails.
+                    (let ((c (and request (process-contact request)))
                           (buf (plist-get (process-plist proc) :log-buffer)))
                       (with-current-buffer buf
                         (goto-char (point-max))
