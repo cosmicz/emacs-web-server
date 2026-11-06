@@ -444,5 +444,96 @@ guard cannot perform the known unsafe worker close on a real socket."
             (should (eq owner (nth 2 (nth index ordered)))))
           (should (eq owner (nth 3 (nth locked-at ordered)))))))))
 
+(defun ws-znrv-test--text (text)
+  "Normalize only whitespace in public contract TEXT."
+  (replace-regexp-in-string "[[:space:]]+" " " text))
+
+(defun ws-znrv-test--setup-doc (text)
+  "Assert TEXT discloses the actual setup wait and callback bound."
+  (setq text (ws-znrv-test--text text))
+  (should (string-match-p "filters, sentinels and timers" text))
+  (should (string-match-p "other Lisp threads" text))
+  (should (string-match-p "two-second deadline is checked between bounded waits" text))
+  (should (string-match-p "callback runtime may extend" text)))
+
+(defun ws-znrv-test--readme ()
+  "Read the README belonging to the loaded fork."
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "README" (file-name-directory (locate-library "web-server"))))
+    (buffer-string)))
+
+(ert-deftest ws/znrv-helper-doc-discloses-setup-reentry ()
+  (ws-znrv-test--setup-doc (documentation 'ws--owner-open-channel)))
+
+(ert-deftest ws/znrv-start-doc-discloses-setup-reentry ()
+  (ws-znrv-test--setup-doc (documentation 'ws-start)))
+
+(ert-deftest ws/znrv-readme-discloses-setup-reentry ()
+  (ws-znrv-test--setup-doc (ws-znrv-test--readme)))
+
+(ert-deftest ws/znrv-channel-loss-claim-requires-owner-observation ()
+  (should (string-match-p "when the owner thread observes the loss"
+                          (ws-znrv-test--text (ws-znrv-test--readme)))))
+
+(ert-deftest ws/znrv-nil-request-retains-accept-failure-log ()
+  (let ((log (generate-new-buffer " *ws-znrv-failure-log*")) (server nil))
+    (unwind-protect
+        (progn
+          (setq server (ws-start #'ignore 0 log))
+          (let* ((listener (ws-process server))
+                 (callback (process-contact listener :log)))
+            (should (functionp callback))
+            (cl-letf (((symbol-function 'process-contact)
+                       (lambda (&rest _) (ert-fail "No contact exists for a nil request")))
+                      ((symbol-function 'ws--owner-lock-process)
+                       (lambda (&rest _) (ert-fail "No request socket exists to lock")))
+                      ((symbol-function 'format-time-string) (lambda (&rest _) "STAMP")))
+              (funcall callback listener nil "accept failed: fixture\n"))
+            (with-current-buffer log
+              (should (equal "STAMP\tnil\tnil\taccept failed: fixture\n" (buffer-string))))))
+      (when server (ws-stop server))
+      (kill-buffer log))))
+
+(ert-deftest ws/znrv-accepted-log-keeps-contact-and-lock-order ()
+  (let* ((log (generate-new-buffer " *ws-znrv-accepted-log*"))
+         (ws-test-deferred--clients nil) (state (list nil))
+         (server (ws-start (ws-test-deferred--handlers state) 0 log)))
+    (unwind-protect
+        (progn
+          (ws-test-deferred--client (ws-test-deferred--port server) (ws-test-deferred--get "/defer"))
+          (should (ws-test-deferred--wait (lambda () (plist-get (car state) :request))))
+          (let* ((child (ws-process (plist-get (car state) :request)))
+                 (listener (ws-process server))
+                 (callback (process-contact listener :log))
+                 (contact (process-contact child))
+                 (lock (symbol-function 'ws--owner-lock-process))
+                 (locks nil))
+            (with-current-buffer log (erase-buffer))
+            (cl-letf (((symbol-function 'ws--owner-lock-process)
+                       (lambda (srv process)
+                         (with-current-buffer log (should (equal "" (buffer-string))))
+                         (push process locks)
+                         (funcall lock srv process)))
+                      ((symbol-function 'format-time-string) (lambda (&rest _) "STAMP")))
+              (funcall callback listener child "accepted fixture\n"))
+            (should (equal (list child) locks))
+            (with-current-buffer log
+              (should (equal (format "STAMP\t%s\t%s\taccepted fixture\n"
+                                     (car contact) (cadr contact))
+                             (buffer-string))))))
+      (mapc (lambda (p) (when (process-live-p p) (delete-process p))) ws-test-deferred--clients)
+      (ws-stop server)
+      (kill-buffer log))))
+
+(ert-deftest ws/znrv-disabled-log-accept-failure-is-safe ()
+  (ws-test-deferred--with #'ignore server
+    (let* ((listener (ws-process server)) (callback (process-contact listener :log)))
+      (should (functionp callback))
+      (cl-letf (((symbol-function 'process-contact) (lambda (&rest _) (ert-fail "Unexpected contact lookup")))
+                ((symbol-function 'ws--owner-lock-process) (lambda (&rest _) (ert-fail "Unexpected nil socket lock"))))
+        (should-not (condition-case err
+                        (funcall callback listener nil "accept failed: no log\n")
+                      (error err)))))))
+
 (provide 'web-server-owner-test)
 ;;; web-server-owner-test.el ends here

@@ -222,7 +222,10 @@ Stop discards pending calls; no callback starts after the stop fence."
 (defun ws--owner-open-channel (server)
   "Create and qualify SERVER's private self-pair on the owner.
 The transient loopback listener retires on the first accept.  Verify that
-the peer is our own sender before using it; setup has a two-second bound.
+the peer is our own sender before using it.  General process output is
+serviced: other processes' filters, sentinels and timers, and other Lisp
+threads, may run.  The two-second deadline is checked between bounded waits;
+callback runtime may extend total setup.
 `ws-start' owns cleanup of every partial resource if any setup step fails."
   (setf (ws-owner-wake-listener server)
         (make-network-process
@@ -260,24 +263,31 @@ the peer is our own sender before using it; setup has a two-second bound.
                           (lambda (p event) (ws--owner-channel-sentinel server p event)))))
 
 (defun ws--connection-log (server log)
-  "Return SERVER's accepted-socket lock wrapper, delegating existing LOG."
+  "Return SERVER's accepted-socket lock wrapper, delegating existing LOG.
+A nil accepted request still logs its failure message, without contact lookup."
   (lambda (proc request message)
     (when request
       ;; make_process's Lisp thread slot does not itself lock the descriptor.
       ;; This callback precedes the accepted socket's first possible dispatch.
-      (ws--owner-lock-process server request)
-      (when log
-        (let ((c (process-contact request))
-              (buf (plist-get (process-plist proc) :log-buffer)))
-          (with-current-buffer buf
-            (goto-char (point-max))
-            (insert (format "%s\t%s\t%s\t%s"
-                            (format-time-string ws-log-time-format)
-                            (cl-first c) (cl-second c) message))))))))
+      (ws--owner-lock-process server request))
+    (when log
+      (let ((c (and request (process-contact request)))
+            (buf (plist-get (process-plist proc) :log-buffer)))
+        (with-current-buffer buf
+          (goto-char (point-max))
+          (insert (format "%s\t%s\t%s\t%s"
+                          (format-time-string ws-log-time-format)
+                          (cl-first c) (cl-second c) message)))))))
 
 ;;;###autoload
 (defun ws-start (handlers port &optional log-buffer &rest network-args)
   "Start a server using HANDLERS and return the server object.
+
+Threaded startup services general process output: other processes'
+filters, sentinels and timers, and other Lisp threads, may run.  The
+two-second deadline is checked between bounded waits; callback runtime
+may extend total startup.  The public listener is created only after channel
+setup.
 
 HANDLERS may be a single function (which is then called on every
 request) or a list of conses of the form (MATCHER . FUNCTION),
@@ -313,9 +323,7 @@ function.
         (with-slots ((proc process)) request
           (ws-response-header proc 200 \\='(\"Content-Type\" . \"text/plain\"))
           (process-send-string proc \"hello world\")))))
-   8080)
-
-"
+   8080)"
   (unless (and (integerp ws-owner-call-queue-limit) (> ws-owner-call-queue-limit 0))
     (error "ws-owner-call-queue-limit must be a positive integer"))
   (let ((server (make-instance 'ws-server :handlers handlers :port port))

@@ -53,13 +53,17 @@ OWNER-THREAD CALLS
 
     The wake resource is one verified private loopback TCP channel, with two
     owner-locked endpoints.  Its temporary listener closes on first accept;
-    the accepted peer must match the sender's local endpoint.  Setup is
-    bounded and partial resources are cleaned on failure.  The mutex covers
+    the accepted peer must match the sender's local endpoint.  Setup services
+    general process output: other processes' filters, sentinels and timers,
+    and other Lisp threads, may run.  The two-second deadline is checked between
+    bounded waits; callback runtime may extend total startup.  The public
+    listener is created only after setup; partial resources are cleaned on
+    failure.  The mutex covers
     admission, one coalesced binary wake byte, and the stop fence.  Workers
     only enqueue and write that notification; they never create, wait for,
     read or close a process.  All channel dispatch and cleanup run on owner.
-    Unexpected channel loss visibly stops the server rather than silently
-    abandoning accepted calls while reporting a live service.
+    Unexpected channel loss visibly stops the server when the owner thread
+    observes the loss.
 
     ws-stop fences admission and discards queued calls before responder
     ON-CLOSE callbacks and channel cleanup.  No callback starts after stop.
