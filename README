@@ -36,6 +36,40 @@ USAGE
 
     Run `make check' to run the included test suite.
 
+OWNER-THREAD CALLS
+    ws-call-on-owner SERVER FUNCTION accepts a callback for the thread that
+    called ws-start.  Its return t means accepted, not FUNCTION's value or a
+    delivered HTTP reply.  The owner must service process output.  Threaded
+    calls always queue, including calls from the owner.  Without make-thread
+    support, detected at start time, callbacks run directly.  Callback errors
+    are reported and contained in both paths.
+
+    Each server captures the positive ws-owner-call-queue-limit (default 64).
+    A full queue or stopped server signals ws-owner-call-refused, with first
+    condition datum queue-full or stopped.  A failed notification refuses
+    with wake-failed and retracts the call.  Refused callbacks never execute.
+    A callback frees its pending slot before running, outside the mutex.
+    Each drain has a finite budget no larger than the captured limit.
+
+    The wake resource is one verified private loopback TCP channel, with two
+    owner-locked endpoints.  Its temporary listener closes on first accept;
+    the accepted peer must match the sender's local endpoint.  Setup is
+    bounded and partial resources are cleaned on failure.  The mutex covers
+    admission, one coalesced binary wake byte, and the stop fence.  Workers
+    only enqueue and write that notification; they never create, wait for,
+    read or close a process.  All channel dispatch and cleanup run on owner.
+    Unexpected channel loss visibly stops the server rather than silently
+    abandoning accepted calls while reporting a live service.
+
+    ws-stop fences admission and discards queued calls before responder
+    ON-CLOSE callbacks and channel cleanup.  No callback starts after stop.
+    ws-respond, ws-responder-abort and ws-stop signal ws-owner-thread-error
+    before mutation if entered off-owner.  ws-respond retains its synchronous
+    written-or-nil contract; use it inside the queued callback for deferred
+    replies.  These guards prevent those illegal entries.  They do not fix
+    independent Emacs process/thread abort defects or establish affinity for
+    application callbacks outside this server.
+
 DOCUMENTATION
     Run `make doc' to build the texinfo documentation, also available
     online [6].

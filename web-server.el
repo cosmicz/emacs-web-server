@@ -53,7 +53,17 @@
   ((handlers :initarg :handlers :accessor ws-handlers :initform nil)
    (process  :initarg :process  :accessor ws-process  :initform nil)
    (port     :initarg :port     :accessor ws-port     :initform nil)
-   (requests :initarg :requests :accessor ws-requests :initform nil)))
+   (requests :initarg :requests :accessor ws-requests :initform nil)
+   (owner-thread :accessor ws-owner-thread :initform nil)
+   (owner-mutex :accessor ws-owner-mutex :initform nil)
+   (owner-limit :accessor ws-owner-limit :initform nil)
+   (owner-queue :accessor ws-owner-queue :initform nil)
+   (owner-count :accessor ws-owner-count :initform 0)
+   (owner-stopped :accessor ws-owner-stopped :initform nil)
+   (owner-wake-pending :accessor ws-owner-wake-pending :initform nil)
+   (owner-wake-process :accessor ws-owner-wake-process :initform nil)
+   (owner-wake-reader :accessor ws-owner-wake-reader :initform nil)
+   (owner-wake-listener :accessor ws-owner-wake-listener :initform nil)))
 
 (defclass ws-request ()
   ((process  :initarg :process  :accessor ws-process  :initform nil)
@@ -90,6 +100,181 @@ See `ws-defer'.")
 (defvar ws-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   "This GUID is defined in RFC6455.")
 
+;;; Queued owner-thread calls
+
+(defvar ws-owner-call-queue-limit 64
+  "Maximum pending owner calls, captured separately by each `ws-start'.
+Must be a positive integer.  A running callback no longer occupies a slot.
+One process-filter drain invokes at most this many callbacks.")
+
+;; Define conditions without requiring `define-error' on older Emacs builds.
+(put 'ws-owner-call-refused 'error-conditions '(ws-owner-call-refused error))
+(put 'ws-owner-call-refused 'error-message "Owner call refused")
+(put 'ws-owner-thread-error 'error-conditions '(ws-owner-thread-error error))
+(put 'ws-owner-thread-error 'error-message "Operation requires the server owner thread")
+
+(defun ws--check-owner (server)
+  "Refuse an off-owner entry to SERVER before any state or socket mutation."
+  (when (and server (ws-owner-thread server)
+             (not (eq (current-thread) (ws-owner-thread server))))
+    (signal 'ws-owner-thread-error nil)))
+
+(defun ws--owner-lock-process (server process)
+  "Explicitly lock PROCESS's descriptors to SERVER's owner, when threaded."
+  (when (ws-owner-thread server)
+    (set-process-thread process (ws-owner-thread server))))
+
+(defun ws--owner-locked (server function)
+  "Call FUNCTION under SERVER's queue mutex, or directly without threads."
+  (let ((mutex (ws-owner-mutex server)))
+    (if mutex
+        (progn
+          (mutex-lock mutex)
+          (unwind-protect (funcall function) (mutex-unlock mutex)))
+      (funcall function))))
+
+(defun ws--owner-invoke (function)
+  "Invoke FUNCTION, containing and reporting callback errors."
+  (condition-case err
+      (funcall function)
+    ((error quit) (message "ws-owner: callback error: %S" err))))
+
+(defun ws--owner-drain (server)
+  "Consume a wake and invoke one finite budget of SERVER's queued calls."
+  (ws--check-owner server)
+  (ws--owner-locked
+   server (lambda () (setf (ws-owner-wake-pending server) nil)))
+  (catch 'empty
+    (dotimes (_ (ws-owner-limit server))
+      (let ((function
+             (ws--owner-locked
+              server
+              (lambda ()
+                (when (and (not (ws-owner-stopped server)) (ws-owner-queue server))
+                  (prog1 (pop (ws-owner-queue server))
+                    ;; Free capacity before a yielding callback can admit work.
+                    (cl-decf (ws-owner-count server))))))))
+        (unless function (throw 'empty nil))
+        (ws--owner-invoke function)))))
+
+(defun ws--owner-notify (server)
+  "Send SERVER's one coalesced wake byte while its queue mutex is held."
+  (unless (ws-owner-wake-pending server)
+    (setf (ws-owner-wake-pending server) t)
+    ;; Both endpoints are owned and remain open until stop fences under this
+    ;; same mutex.  At most one binary byte is outstanding: this write cannot
+    ;; fill the connection and enter Emacs's would-block worker-select path.
+    (process-send-string (ws-owner-wake-process server) "x")))
+
+(defun ws-call-on-owner (server function)
+  "Accept FUNCTION for execution on SERVER's owner thread and return t.
+Acceptance is neither FUNCTION's result nor a written HTTP response.
+The threaded path queues even when called by the owner; service process
+output on that owner to execute it.  Callback errors are contained/reported.
+Without thread support FUNCTION runs directly, with the same acceptance
+and error-containment meaning.
+
+Signal `ws-owner-call-refused' before acceptance with first condition datum
+`stopped', `queue-full' or `wake-failed'.  Refused functions never execute.
+Stop discards pending calls; no callback starts after the stop fence."
+  (unless (functionp function) (signal 'wrong-type-argument (list 'functionp function)))
+  (ws--owner-locked
+   server
+   (lambda ()
+     (when (ws-owner-stopped server)
+       (signal 'ws-owner-call-refused '(stopped)))
+     (if (not (ws-owner-thread server))
+         (ws--owner-invoke function)
+       (when (>= (ws-owner-count server) (ws-owner-limit server))
+         (signal 'ws-owner-call-refused '(queue-full)))
+       (unless (and (process-live-p (ws-owner-wake-process server))
+                    (process-live-p (ws-owner-wake-reader server)))
+         (signal 'ws-owner-call-refused '(wake-failed)))
+       (setf (ws-owner-queue server)
+             (nconc (ws-owner-queue server) (list function)))
+       (cl-incf (ws-owner-count server))
+       (condition-case err
+           (ws--owner-notify server)
+         ((error quit)
+          ;; Retract this last admission, including when FUNCTION is also
+          ;; present earlier in the FIFO.  Never falsely return acceptance.
+          (setf (ws-owner-queue server) (butlast (ws-owner-queue server))
+                (ws-owner-wake-pending server) nil)
+          (cl-decf (ws-owner-count server))
+          (signal 'ws-owner-call-refused (list 'wake-failed err)))))))
+  t)
+
+(defun ws--owner-close-channel (server)
+  "Retire all of SERVER's wake resources on the owner after fencing stop."
+  (dolist (process (list (ws-owner-wake-process server)
+                        (ws-owner-wake-reader server)
+                        (ws-owner-wake-listener server)))
+    (when (and process (process-live-p process))
+      (set-process-sentinel process #'ignore)
+      (delete-process process))))
+
+(defun ws--owner-channel-sentinel (server process event)
+  "Stop SERVER visibly on unexpected loss of its owned wake PROCESS."
+  (when (and (not (process-live-p process)) (not (ws-owner-stopped server)))
+    (message "ws-owner: stopping server after wake channel loss: %s" event)
+    (ws-stop server)))
+
+(defun ws--owner-open-channel (server)
+  "Create and qualify SERVER's private self-pair on the owner.
+The transient loopback listener retires on the first accept.  Verify that
+the peer is our own sender before using it; setup has a two-second bound.
+`ws-start' owns cleanup of every partial resource if any setup step fails."
+  (setf (ws-owner-wake-listener server)
+        (make-network-process
+         ;; The accepted reader inherits this name; do not call it a listener.
+         :name "ws-owner-channel" :server t :host "127.0.0.1"
+         :family 'ipv4 :service t :noquery t :coding 'binary :filter #'ignore
+         :sentinel #'ignore
+         :log (lambda (listener child _message)
+                (when child
+                  (if (ws-owner-wake-reader server)
+                      (delete-process child)
+                    (setf (ws-owner-wake-reader server) child)
+                    (ws--owner-lock-process server child))
+                  (delete-process listener)))))
+  (ws--owner-lock-process server (ws-owner-wake-listener server))
+  (setf (ws-owner-wake-process server)
+        (make-network-process
+         :name "ws-owner-wake-sender" :host "127.0.0.1" :family 'ipv4
+         :service (process-contact (ws-owner-wake-listener server) :service)
+         :noquery t :coding 'binary :filter #'ignore :sentinel #'ignore))
+  (ws--owner-lock-process server (ws-owner-wake-process server))
+  (let ((deadline (+ (float-time) 2)))
+    (while (and (not (ws-owner-wake-reader server)) (< (float-time) deadline))
+      (accept-process-output nil 0.01)))
+  (unless (and (ws-owner-wake-reader server)
+               (process-live-p (ws-owner-wake-reader server))
+               (process-live-p (ws-owner-wake-process server))
+               (equal (process-contact (ws-owner-wake-reader server) :remote)
+                      (process-contact (ws-owner-wake-process server) :local)))
+    (error "ws-owner: wake setup refused: absent or unexpected peer"))
+  (set-process-filter (ws-owner-wake-reader server)
+                      (lambda (_process _text) (ws--owner-drain server)))
+  (dolist (process (list (ws-owner-wake-process server) (ws-owner-wake-reader server)))
+    (set-process-sentinel process
+                          (lambda (p event) (ws--owner-channel-sentinel server p event)))))
+
+(defun ws--connection-log (server log)
+  "Return SERVER's accepted-socket lock wrapper, delegating existing LOG."
+  (lambda (proc request message)
+    (when request
+      ;; make_process's Lisp thread slot does not itself lock the descriptor.
+      ;; This callback precedes the accepted socket's first possible dispatch.
+      (ws--owner-lock-process server request)
+      (when log
+        (let ((c (process-contact request))
+              (buf (plist-get (process-plist proc) :log-buffer)))
+          (with-current-buffer buf
+            (goto-char (point-max))
+            (insert (format "%s\t%s\t%s\t%s"
+                            (format-time-string ws-log-time-format)
+                            (cl-first c) (cl-second c) message))))))))
+
 ;;;###autoload
 (defun ws-start (handlers port &optional log-buffer &rest network-args)
   "Start a server using HANDLERS and return the server object.
@@ -123,52 +308,71 @@ function MATCH and the `ws-response-header' convenience
 function.
 
   (ws-start
-   `(((lambda (_) t) .
+   \\=`(((lambda (_) t) .
       (lambda (request)
         (with-slots ((proc process)) request
-          (ws-response-header proc 200 '(\"Content-Type\" . \"text/plain\"))
+          (ws-response-header proc 200 \\='(\"Content-Type\" . \"text/plain\"))
           (process-send-string proc \"hello world\")))))
    8080)
 
 "
+  (unless (and (integerp ws-owner-call-queue-limit) (> ws-owner-call-queue-limit 0))
+    (error "ws-owner-call-queue-limit must be a positive integer"))
   (let ((server (make-instance 'ws-server :handlers handlers :port port))
-        (log (when log-buffer (get-buffer-create log-buffer))))
-    (setf (ws-process server)
-          (apply
-           #'make-network-process
-           :name "ws-server"
-           :service (ws-port server)
-           :filter 'ws-filter
-           :server t
-           :nowait (< emacs-major-version 26)
-           :family 'ipv4
-           :coding 'no-conversion
-           :plist (append (list :server server)
-                          (when log (list :log-buffer log)))
-           :log (when log
-                  (lambda (proc request message)
-                    (let ((c (process-contact request))
-                          (buf (plist-get (process-plist proc) :log-buffer)))
-                      (with-current-buffer buf
-                        (goto-char (point-max))
-                        (insert (format "%s\t%s\t%s\t%s"
-                                        (format-time-string ws-log-time-format)
-                                        (cl-first c) (cl-second c) message))))))
-           network-args))
-    (push server ws-servers)
-    server))
+        (log (when log-buffer (get-buffer-create log-buffer)))
+        (started nil))
+    (setf (ws-owner-limit server) ws-owner-call-queue-limit)
+    ;; Runtime detection preserves no-thread builds and the controlled path.
+    (when (fboundp 'make-thread)
+      (setf (ws-owner-thread server) (current-thread)
+            (ws-owner-mutex server) (make-mutex "ws-owner-queue")))
+    (unwind-protect
+        (progn
+          ;; Channel setup services process output.  Finish it before exposing
+          ;; the public listener, so no handler sees an unready owner queue.
+          (when (ws-owner-thread server) (ws--owner-open-channel server))
+          (setf (ws-process server)
+                (apply
+                 #'make-network-process
+                 :name "ws-server"
+                 :service (ws-port server)
+                 :filter 'ws-filter
+                 :server t
+                 :nowait (< emacs-major-version 26)
+                 :family 'ipv4
+                 :coding 'no-conversion
+                 :plist (append (list :server server)
+                                (when log (list :log-buffer log)))
+                 :log (ws--connection-log server log)
+                 network-args))
+          (ws--owner-lock-process server (ws-process server))
+          (push server ws-servers)
+          (setq started t)
+          server)
+      (unless started (ws-stop server)))))
 
 (defun ws-stop (server)
   "Stop SERVER.
 Pending deferred responders end as `stopped' before their connections
-are deleted."
+are deleted.  Fence admissions and discard queued owner calls first.
+Signal `ws-owner-thread-error' before mutation if called off the owner."
+  (ws--check-owner server)
+  (ws--owner-locked
+   server (lambda () (setf (ws-owner-stopped server) t
+                          (ws-owner-queue server) nil
+                          (ws-owner-count server) 0
+                          (ws-owner-wake-pending server) nil)))
   (setq ws-servers (remove server ws-servers))
-  (dolist (request (copy-sequence (ws-requests server)))
-    (let ((responder (ws-request-responder request)))
-      (when responder
-        (ws--responder-finish responder 'stopped))))
-  (mapc #'delete-process (append (mapcar #'ws-process (ws-requests server))
-                                 (list (ws-process server)))))
+  (unwind-protect
+      (progn
+        (dolist (request (copy-sequence (ws-requests server)))
+          (let ((responder (ws-request-responder request)))
+            (when responder
+              (ws--responder-finish responder 'stopped))))
+        (dolist (process (append (mapcar #'ws-process (ws-requests server))
+                                (list (ws-process server))))
+          (when (and process (process-live-p process)) (delete-process process))))
+    (ws--owner-close-channel server)))
 
 (defun ws-stop-all ()
   "Stop all servers in `ws-servers'."
@@ -366,6 +570,8 @@ The reply is claimed before the first write: RESPONDER moves to
 (other process output may run between write bunches) writes nothing.
 An abort, disconnect, overflow or stop during the write still ends the
 responder once, and this call then returns nil."
+  (ws--check-owner
+   (plist-get (process-plist (ws-process (ws-responder-request responder))) :server))
   (when (eq (ws-responder-state responder) 'pending)
     (setf (ws-responder-state responder) 'responding)
     (let ((proc (ws-process (ws-responder-request responder))))
@@ -384,6 +590,8 @@ responder once, and this call then returns nil."
 (defun ws-responder-abort (responder)
   "End pending RESPONDER without a reply and close its connection.
 Return t when this call ended it, nil when it had already ended."
+  (ws--check-owner
+   (plist-get (process-plist (ws-process (ws-responder-request responder))) :server))
   (ws--responder-finish responder 'aborted))
 
 (defun ws-parse-request (request)
