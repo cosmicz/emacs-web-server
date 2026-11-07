@@ -182,7 +182,7 @@ Connection: keep-alive
 User-Agent: curl/7.33.0
 Host: localhost:8080
 Accept: */*
-Content-Length: 273
+Content-Length: 246
 Expect: 100-continue
 Content-Type: multipart/form-data; boundary=----------------f1270d0deb77af03
 
@@ -265,7 +265,7 @@ Accept-Encoding: gzip, deflate
 DNT: 1
 Content-Type: application/json
 Referer: http://localhost:4444/complex.org
-Content-Length: 33
+Content-Length: 29
 Cookie: __utma=111872281.1462392269.1345929539.1345929539.1345929539.1
 Connection: keep-alive
 Pragma: no-cache
@@ -348,7 +348,7 @@ At least when it comes in a single chunk."
 User-Agent: curl/7.34.0
 Host: localhost:9008
 Accept: */*
-Content-Length: 9086
+Content-Length: 109074
 Expect: 100-continue
 Content-Type: multipart/form-data; boundary=----------------e458fb665704290b
 
@@ -664,9 +664,8 @@ reading stderr after curl is gone."
 ;; same connection.
 ;;
 ;; Input boundary: the request is what the filter had received when the
-;; handler ran, as `ws-parse-request' already defines it (without
-;; Content-Length framing, bytes coalesced into the completing chunk belong
-;; to that request).  Every byte received after deferral is counted by
+;; handler ran, after complete Content-Length framing.  The coalesced
+;; fixture explicitly declares its body; undeclared extras are refused.  Every byte received after deferral is counted by
 ;; `ws-responder-input-bytes', checked against the bound and discarded: it
 ;; is not appended to the request's pending input and the responder keeps
 ;; no copy.
@@ -834,7 +833,7 @@ and never dispatches a second handler."
                  (process-list)))))
 
 (ert-deftest ws/deferred-coalesced-input-belongs-to-the-request ()
-  "Boundary control: bytes coalesced into the completing chunk belong to the
+  "Boundary control: declared body bytes coalesced into the completing chunk belong to the
 request.  One chunk is fed deterministically through the real `ws-filter'
 on the owned accepted connection, so no packet split can change what the
 filter sees: one handler, no post-deferral input counted, one reply."
@@ -843,8 +842,11 @@ filter sees: one handler, no post-deferral input counted, one reply."
       (let* ((a (ws-test-deferred--client (ws-test-deferred--port server)))
              (conn (ws-test-deferred--accepted-connection server)))
         (should conn)
-        (ws-filter conn (concat (ws-test-deferred--get "/defer")
-                                "GET /defer HTTP/1.1\r\n\r\n"))
+        (let ((payload "GET /defer HTTP/1.1\r\n\r\n"))
+          (ws-filter conn
+                     (concat "GET /defer HTTP/1.1\r\n"
+                             (format "Content-Length: %d\r\n\r\n" (length payload))
+                             payload)))
         (let ((responder (plist-get (car state) :responder))
               (request (plist-get (car state) :request)))
           (should responder)
@@ -1141,10 +1143,10 @@ closes it; by then every line for it has been logged."
                          port)
                  (ws-test-log--text log)))))))
 
-(ert-deftest ws/log-disabled-installs-no-callback ()
-  "Without a log buffer, `ws-start' installs no :log callback."
+(ert-deftest ws/log-disabled-keeps-admission-without-buffer ()
+  "Without a log buffer, admission stays active without creating a log buffer."
   (ws-test-log--with server nil
-    (should-not (process-contact (ws-process server) :log))
+    (should (functionp (process-contact (ws-process server) :log)))
     (should-not (plist-member (process-plist (ws-process server)) :log-buffer))))
 
 (provide 'web-server-test)

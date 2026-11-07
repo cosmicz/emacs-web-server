@@ -17,6 +17,49 @@ STATUS
 
     [1]  http://eschulte.github.io/emacs-web-server/benchmark/
 
+
+REQUEST FRAMING
+    Requests are dispatched only after the complete Content-Length body has
+    arrived, for every content type.  Missing Content-Length means an empty
+    body; coalesced undeclared bytes are refused.  Request transfer codings
+    (including chunked) are unsupported (501).  Invalid or ambiguous framing
+    is refused (400), headers above the ceiling give 431, bodies above the
+    absolute ceiling give 413, and late input gives 408.  These transport
+    refusals occur before application handlers or authentication.
+
+    ws-start validates and captures ws-request-body-limit (8388608 octets),
+    ws-request-header-limit (65536 octets, including request line and all of
+    CRLFCRLF), ws-request-framing-timeout (30 positive finite seconds), and
+    ws-request-incomplete-limit (16 positive integer sockets).  There is no
+    unlimited sentinel.  Changing globals does not change an existing server.
+    The cap includes accepted zero-byte sockets and partial headers/bodies.
+    The default retained pending-string ceiling is 16*(8388608+65536), or
+    135266304 octets (129 MiB); metadata, socket/OS storage and completed body
+    copies are additional.  Deferred, streaming, WebSocket lifetimes and the
+    kernel backlog are outside this framing cap.
+
+    Expiry is LAZY: there is no timer promising to close every quiet peer at
+    30 seconds.  First input fixes a completion deadline that later bytes
+    never renew; expiry is checked on later input before dispatch.  On a new
+    accept, expired incomplete peers are silently reclaimed before the cap
+    is checked.  Before first input their clock is admission time; afterward
+    it is first-input time.  At a full cap new peers are silently refused
+    until a slot is released or an entry expires against its applicable
+    timestamp (at most one interval after admission or first input).  Without
+    further input/admission, quiet entries can remain until EOF or stop.
+    Unexpired, dispatched and deferred responses are never pressure-evicted.
+
+    Clime defaults to 127.0.0.1:8080 and explicitly passes :host.  A wider
+    :host exposes this pre-authentication framing/refusal path more widely;
+    authentication does not reserve framing capacity.  Choose binds and
+    limits for the intended exposure.  EOF, refusal, completion and stop
+    release framing ownership; optional logging failure does not revoke a
+    successful admission.  Caller sentinels keep their native accept/close
+    events, including deleted then open-on-dead for a cap-refused accept.
+
+    Complete-body framing reimplements the idea discussed in upstream PR #31
+    (dickmao) for all content types and octets; that patch is not imported.
+
 USAGE
     See the examples/ directory in this repository for examples
     demonstrating usage.  The Emacs web-server is also used to run a

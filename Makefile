@@ -20,7 +20,7 @@ doc/dir:
 	$(MAKE) -C doc/ dir
 
 check: $(SRC)
-	$(BATCH) -l cl -l ert -l web-server-test -f ert-run-tests-batch-and-exit
+	$(BATCH) -l cl -l ert -l web-server-test -l web-server-frame-test -f ert-run-tests-batch-and-exit
 
 clean:
 	rm -rf $(ELC) $(PACKAGE) $(PACKAGE).tar
@@ -35,7 +35,7 @@ REQ=$(shell $(call PARSE,Package-Requires))
 DEFPKG=(define-package "$(NAME)" "$(VERSION)"\n  "$(DOC)"\n  (quote $(REQ)))
 PACKAGE=$(NAME)-$(VERSION)
 
-$(PACKAGE): $(filter-out web-server-test.el, $(SRC)) doc/web-server.info doc/dir
+$(PACKAGE): $(filter-out web-server-test.el web-server-frame-test.el, $(SRC)) doc/web-server.info doc/dir
 	mkdir -p $(PACKAGE)
 	cp $^ $(PACKAGE)
 	sed -n '/;;; Commentary:/,/;;; Code:/p' web-server.el|tail -n+3|head -n-2|cut -c4- >$(PACKAGE)/README
