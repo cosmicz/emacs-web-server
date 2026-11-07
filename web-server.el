@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2014 Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch.
+;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target and raw query.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 ;; Maintainer: Eric Schulte <schulte.eric@gmail.com>
@@ -740,6 +740,32 @@ Wait without decoding partial forms.  Raw body bytes are never trimmed."
         t)
     (setf (ws-active request) nil)
     nil))
+
+(defun ws-request-target (request)
+  "Return REQUEST's request-target exactly as received, or nil.
+It is read from the request line that framing accepted, so it is nil
+until the complete head has been accepted and for a refused head.  No
+percent-decoding and no \"+\" mapping is applied.  The caller's match
+data is preserved."
+  (let ((line (ws-frame-request-line request)))
+    (when line
+      (save-match-data
+        ;; Match as framing does, whatever the caller's `case-fold-search'.
+        (let ((case-fold-search t))
+          (when (string-match ws-http-method-rx line)
+            (match-string 2 line)))))))
+
+(defun ws-request-raw-query (request)
+  "Return the raw query of REQUEST's request-target, or nil.
+The query is the text after the first \"?\", exactly as received: no
+percent-decoding and no \"+\" mapping.  It is \"\" for a target ending
+in \"?\", and nil when the target has no \"?\" or was not parsed.
+The caller's match data is preserved."
+  (let ((target (ws-request-target request)))
+    (when target
+      (save-match-data
+        (when (string-match "\\?" target)
+          (substring target (match-end 0)))))))
 
 (defun ws-call-handler (request handlers)
   (catch 'matched-handler

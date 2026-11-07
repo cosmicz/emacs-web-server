@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2021  Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding.
+;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target and raw query accessors.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 
@@ -173,6 +173,112 @@ Connection: keep-alive
             (should (string= (cdr (assoc :GET headers)) "/"))
             (should (string= (cdr (assoc :CONNECTION headers)) "keep-alive"))))
       (ws-stop server))))
+
+(defun ws-test-parse-chunks (&rest chunks)
+  "Feed CHUNKS to a fresh request as successive arrivals; return it.
+Each chunk is appended to the pending input and parsed, as `ws-filter' does."
+  (let ((request (make-instance 'ws-request)))
+    (dolist (chunk chunks request)
+      (setf (ws-pending request) (concat (ws-pending request) chunk))
+      (ws-parse-request request))))
+
+(ert-deftest ws/request-target-raw ()
+  "The request-target and its query are kept exactly as received."
+  (let ((request (ws-test-parse-chunks
+                  "GET /p?a=b%3Dc&x=%26&sp=a+b&u=%C3%A9 HTTP/1.1\r\nHost: h\r\n\r\n")))
+    (should (equal "/p?a=b%3Dc&x=%26&sp=a+b&u=%C3%A9" (ws-request-target request)))
+    (should (equal "a=b%3Dc&x=%26&sp=a+b&u=%C3%A9" (ws-request-raw-query request)))
+    (should-not (multibyte-string-p (ws-request-target request)))))
+
+(ert-deftest ws/request-target-raw-bytes ()
+  "Raw non-ASCII bytes in the request-target stay unibyte and unchanged."
+  (let ((request (ws-test-parse-chunks
+                  "GET /caf\303\251?q=\303\251 HTTP/1.1\r\nHost: h\r\n\r\n")))
+    (should (equal "/caf\303\251?q=\303\251" (ws-request-target request)))
+    (should (equal "q=\303\251" (ws-request-raw-query request)))
+    (should-not (multibyte-string-p (ws-request-raw-query request)))))
+
+(ert-deftest ws/request-raw-query-forms ()
+  "The raw query distinguishes no query, an empty query and absolute form."
+  (let ((unparsed (make-instance 'ws-request)))
+    (should-not (ws-request-target unparsed))
+    (should-not (ws-request-raw-query unparsed)))
+  (dolist (case '(("/p" . nil) ("/p?" . "") ("/p?a?b" . "a?b")
+                  ("http://h/p?q=1" . "q=1")))
+    (let ((request (ws-test-parse-chunks
+                    (concat "GET " (car case) " HTTP/1.1\r\nHost: h\r\n\r\n"))))
+      (should (equal (car case) (ws-request-target request)))
+      (should (equal (cdr case) (ws-request-raw-query request))))))
+
+(ert-deftest ws/request-target-legacy-headers-unchanged ()
+  "Keeping the raw target leaves the parsed header alist as it was.
+The path stays the method entry's value and the query is still decoded
+into pairs; this is compatibility, not an endorsement of that decoding."
+  (let ((request (ws-test-parse-chunks
+                  "GET /p?a=b%3Dc&x=%26&sp=a+b&u=%C3%A9 HTTP/1.1\r\nHost: h\r\n\r\n")))
+    (should (equal '((:GET . "/p") ("u" . "\303\251") ("sp" . "a+b") ("" . "")
+                     ("x" . "") ("a" . "b=c") (:HOST . "h"))
+                   (cdr (ws-headers request))))))
+
+(ert-deftest ws/request-target-fragmented-input ()
+  "The target is set once framing has the complete request head.
+Arrivals are fed as `ws-filter' does: framed by `ws--frame-append', then
+parsed.  Until the head is complete no target is recorded."
+  (let ((request (make-instance 'ws-request)))
+    (cl-flet ((feed (chunk)
+                (ws--frame-append request chunk)
+                (ws-parse-request request)))
+      (should-not (feed "GET /p?a=%2"))
+      (should-not (ws-request-target request))
+      (should-not (feed "6b HTTP/1.1\r\nHo"))
+      (should-not (ws-request-target request))
+      (should (feed "st: h\r\n\r\n"))
+      (should (equal "/p?a=%26b" (ws-request-target request)))
+      (should (equal "a=%26b" (ws-request-raw-query request))))))
+
+(defun ws-test-refused-head (head)
+  "Parse HEAD as a legacy direct caller does; return the refused request.
+Fail unless framing refuses it.  Without a process no reply is written."
+  (let ((request (make-instance 'ws-request)))
+    (setf (ws-pending request) head)
+    (should-not (catch 'close-connection (ws-parse-request request) 'parsed))
+    request))
+
+(ert-deftest ws/request-target-uncommon-method ()
+  "A method outside `ws-http-common-methods' is refused with no target."
+  (let ((request (ws-test-refused-head
+                  "PATCH /p?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")))
+    (should (equal 400 (ws-frame-error request)))
+    (should-not (ws-request-target request))
+    (should-not (ws-request-raw-query request))))
+
+(ert-deftest ws/request-target-refused-head ()
+  "A head refused after a valid request line records no target.
+A second request-line-shaped line is not a field line, so framing refuses
+the whole head; the first line's target must not survive that."
+  (let ((request (ws-test-refused-head
+                  "GET /p?a=1 HTTP/1.1\r\nGET /other?x=1 HTTP/1.1\r\n\r\n")))
+    (should (equal 400 (ws-frame-error request)))
+    (should-not (ws-request-target request))
+    (should-not (ws-request-raw-query request))))
+
+(ert-deftest ws/request-target-method-case ()
+  "A head framing accepts has a target whatever `case-fold-search' is.
+Framing matches the method case-insensitively, so the accessor does too."
+  (let ((request (ws-test-parse-chunks
+                  "get /p?x=1 HTTP/1.1\r\nHost: h\r\n\r\n"))
+        (case-fold-search nil))
+    (should (equal "/p?x=1" (ws-request-target request)))
+    (should (equal "x=1" (ws-request-raw-query request)))))
+
+(ert-deftest ws/request-target-keeps-match-data ()
+  "The accessors leave the caller's match data as it was."
+  (let ((request (ws-test-parse-chunks
+                  "GET /p?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")))
+    (should (string-match "b\\(c\\)" "abcd"))
+    (should (equal "x=1" (ws-request-raw-query request)))
+    (should (equal "/p?x=1" (ws-request-target request)))
+    (should (equal '(1 3 2 3) (match-data)))))
 
 (ert-deftest ws/parse-post-data ()
   (let ((server (ws-start nil ws-test-port))
