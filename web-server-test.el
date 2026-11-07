@@ -24,26 +24,90 @@
 
 (defvar ws-test-port 8999)
 
+(defvar ws-test-curl-deadline 10
+  "Seconds `ws-test-curl-to-string' may spend on one curl call.
+The bound covers waiting for curl to exit and reading all of its
+output.  It is longer than curl's own -m 4, so a curl timeout is
+still reported as curl's exit status.")
+
 (defun ws-test-curl-to-string (url &optional get-params post-params curl-flags)
-  "Curl URL with optional parameters."
-  (async-shell-command
-   (format "curl -s -m 4 %s %s %s localhost:%s/%s"
-           (or curl-flags "")
-           (if get-params
-               (mapconcat (lambda (p) (format "-d \"%s=%s\"" (car p) (cdr p)))
-                          get-params " ")
-             "")
-           (if post-params
-               (mapconcat (lambda (p) (format "-F \"%s=%s\"" (car p) (cdr p)))
-                          post-params " ")
-             "")
-           ws-test-port url))
-  (unwind-protect
-      (with-current-buffer "*Async Shell Command*"
-        (while (get-buffer-process (current-buffer)) (sit-for 0.1))
-        (goto-char (point-min))
-        (buffer-string))
-    (kill-buffer "*Async Shell Command*")))
+  "Curl URL with optional parameters and return curl's stdout.
+Curl runs on pipes, not a terminal, and asynchronously, so the
+in-process server keeps answering.  Completion follows curl's real
+process status, not its sentinel.  Unless curl exits 0, the test
+fails with curl's exit status, stderr and stdout and the command.
+If curl or its output is not finished within `ws-test-curl-deadline'
+seconds, the test fails with the phase, curl's status and the output
+read so far.
+An HTTP error status is part of the response, not a curl failure."
+  (let* ((command
+          (format "curl -sS -m 4 %s %s %s localhost:%s/%s"
+                  (or curl-flags "")
+                  (if get-params
+                      (mapconcat (lambda (p) (format "-d \"%s=%s\"" (car p) (cdr p)))
+                                 get-params " ")
+                    "")
+                  (if post-params
+                      (mapconcat (lambda (p) (format "-F \"%s=%s\"" (car p) (cdr p)))
+                                 post-params " ")
+                    "")
+                  ws-test-port url))
+         (out (generate-new-buffer " *ws-test-curl*"))
+         (err (generate-new-buffer " *ws-test-curl-stderr*"))
+         ;; Own sentinels, so no process status text lands in either buffer.
+         (stderr (make-pipe-process :name "ws-test-curl-stderr" :buffer err
+                                    :coding 'binary :noquery t
+                                    :sentinel #'ignore))
+         (deadline (+ (float-time) ws-test-curl-deadline))
+         proc)
+    (unwind-protect
+        (let ((check
+               (lambda (phase)
+                 (when (> (float-time) deadline)
+                   (ert-fail
+                    (list :curl-timeout ws-test-curl-deadline
+                          :phase phase
+                          :status (process-status proc)
+                          :exit (and (memq (process-status proc) '(exit signal))
+                                     (process-exit-status proc))
+                          :stderr (with-current-buffer err (buffer-string))
+                          :stdout (with-current-buffer out (buffer-string))
+                          :command command))))))
+          (setq proc (make-process
+                      :name "ws-test-curl" :buffer out
+                      :command (list shell-file-name shell-command-switch command)
+                      :connection-type 'pipe :coding 'binary
+                      :stderr stderr :noquery t
+                      :sentinel #'ignore))
+          ;; Wait on process status, not on a sentinel, so a sentinel that
+          ;; never runs cannot stall the wait.  A nil process lets the
+          ;; in-process server and every other process callback run.
+          (while (process-live-p proc)
+            (funcall check 'exit)
+            (accept-process-output nil 0.05))
+          ;; The stderr pipe closes at EOF, so it is complete when not live.
+          (while (process-live-p stderr)
+            (funcall check 'stderr)
+            (accept-process-output nil 0.05))
+          ;; Read whatever stdout was still unread when curl exited.
+          (while (progn (funcall check 'stdout)
+                        (accept-process-output proc 0)))
+          (let ((stdout (with-current-buffer out (buffer-string))))
+            (unless (and (eq (process-status proc) 'exit)
+                         (zerop (process-exit-status proc)))
+              (ert-fail
+               (list :curl-exit (if (eq (process-status proc) 'exit)
+                                    (process-exit-status proc)
+                                  (list (process-status proc)
+                                        (process-exit-status proc)))
+                     :stderr (with-current-buffer err (buffer-string))
+                     :stdout stdout
+                     :command command)))
+            stdout))
+      (when proc (delete-process proc))
+      (delete-process stderr)
+      (kill-buffer out)
+      (kill-buffer err))))
 
 (defmacro ws-test-with (handler &rest body)
   (declare (indent 1))
@@ -329,8 +393,10 @@ Content-Type: application/octet-stream
     (should (string= (ws-test-curl-to-string "") "I am chunked"))))
 
 (ert-deftest ws/simple-gzip ()
-  "Test a simple server using gzip content/transfer encoding."
-  (cl-macrolet ((gzipper (header)
+  "Test a simple server using gzip content/transfer encoding.
+curl decodes a gzip Content-Encoding under --compressed, but a gzip
+Transfer-Encoding only under --tr-encoding, which also sends TE: gzip."
+  (cl-macrolet ((gzipper (header flag)
                          `(ws-test-with
                               (lambda (request)
                                 (with-slots (process) request
@@ -339,10 +405,250 @@ Content-Type: application/octet-stream
                                     '(,header . "gzip"))
                                   (ws-send process "I am zipped")))
                             (should (string= (ws-test-curl-to-string
-                                              "" nil nil "--compressed")
+                                              "" nil nil ,flag)
                                              "I am zipped")))))
-    (gzipper "Content-Encoding")
-    (gzipper "Transfer-Encoding")))
+    (gzipper "Content-Encoding" "--compressed")
+    (gzipper "Transfer-Encoding" "--tr-encoding")))
+
+(ert-deftest ws/curl-helper-fails-on-curl-error ()
+  "A curl failure fails the test with curl's own diagnostic, not \"\".
+The handler writes nothing, so the server closes the connection
+without a reply and curl exits nonzero with empty stdout."
+  (ws-test-with (lambda (_request) nil)
+    (let* ((err (should-error (ws-test-curl-to-string "")
+                              :type 'ert-test-failed))
+           (data (cadr err))
+           (code (plist-get data :curl-exit)))
+      (message "ws/curl-helper-fails-on-curl-error: curl exit %S" code)
+      (should (integerp code))
+      (should-not (zerop code))
+      (should (equal "" (plist-get data :stdout)))
+      (should (string-match-p (format "curl: (%d)" code)
+                              (plist-get data :stderr)))
+      (should (string-match-p "curl -sS" (plist-get data :command))))))
+
+(ert-deftest ws/curl-helper-returns-empty-body ()
+  "A successful response with an empty body is \"\", not a failure."
+  (ws-test-with
+      (lambda (request)
+        (with-slots (process) request
+          (ws-response-header process 200 '("Content-type" . "text/plain"))))
+    (should (string= "" (ws-test-curl-to-string "")))))
+
+(ert-deftest ws/curl-helper-returns-4xx-body ()
+  "An HTTP error status is a response for the test, not a curl failure."
+  (ws-test-with
+      (lambda (request)
+        (with-slots (process) request
+          (ws-response-header process 404 '("Content-type" . "text/plain"))
+          (ws-send process "missing")))
+    (should (string= "missing" (ws-test-curl-to-string "")))))
+
+(defmacro ws-test-curl--bounded (seconds &rest body)
+  "Run BODY, giving up after SECONDS.
+Return (:value VALUE) when BODY returns VALUE, or :outer-bound when
+SECONDS pass first.  A timer throws out of whatever BODY is waiting
+in, so a helper that never completes fails the test instead of
+hanging the suite."
+  (declare (indent 1))
+  (let ((tag (make-symbol "tag"))
+        (timer (make-symbol "timer")))
+    `(let* ((,tag (make-symbol "ws-test-curl--bounded"))
+            (,timer (run-at-time ,seconds nil
+                                 (lambda () (throw ,tag :outer-bound)))))
+       (unwind-protect
+           (catch ,tag (list :value (progn ,@body)))
+         (cancel-timer ,timer)))))
+
+(defmacro ws-test-curl--with-stub (script &rest body)
+  "Run BODY with `curl' on PATH replaced by the shell SCRIPT.
+The helper's own command line then runs SCRIPT, whose output and
+exit status the test controls exactly.  SCRIPT finds its directory
+in $WS_TEST_CURL_STUB, and appends the pid of each background job it
+starts to the file pids there; those jobs are terminated on exit."
+  (declare (indent 1))
+  (let ((dir (make-symbol "dir")))
+    `(let ((,dir (file-name-as-directory
+                  (make-temp-file "ws-test-curl-stub" t))))
+       (unwind-protect
+           (let ((process-environment
+                  (append (list (concat "PATH=" ,dir path-separator
+                                        (getenv "PATH"))
+                                (concat "WS_TEST_CURL_STUB=" ,dir))
+                          process-environment)))
+             (with-temp-file (expand-file-name "curl" ,dir)
+               (insert "#!/bin/sh\n" ,script))
+             (set-file-modes (expand-file-name "curl" ,dir) #o755)
+             ,@body)
+         (let ((pids (expand-file-name "pids" ,dir)))
+           (when (file-exists-p pids)
+             (dolist (pid (split-string (with-temp-buffer
+                                          (insert-file-contents pids)
+                                          (buffer-string))))
+               (ignore-errors (signal-process (string-to-number pid) 'TERM)))))
+         (delete-directory ,dir t)))))
+
+(defun ws-test-curl--when-exited (file)
+  "Create FILE once Emacs sees the helper's curl process exit.
+Return the polling timer.  A stand-in curl's background job can wait
+for FILE, so what it writes is ordered after the exit."
+  (let (proc timer)
+    (setq timer
+          (run-at-time
+           0 0.01
+           (lambda ()
+             ;; Keep the process once seen: an exited process leaves the
+             ;; process list, so `get-process' cannot find it again.
+             (setq proc (or proc (get-process "ws-test-curl")))
+             (when (and proc (memq (process-status proc) '(exit signal)))
+               (write-region "" nil file nil 'silent)
+               (cancel-timer timer)))))
+    timer))
+
+(defun ws-test-curl--leftovers ()
+  "Return the helper's live processes and buffers, which should be none."
+  (append (cl-remove-if-not
+           (lambda (p) (and (process-live-p p)
+                            (string-prefix-p "ws-test-curl" (process-name p))))
+           (process-list))
+          (cl-remove-if-not
+           (lambda (b) (string-prefix-p " *ws-test-curl" (buffer-name b)))
+           (buffer-list))))
+
+;; Advising a primitive such as `make-process' normally makes a native
+;; build compile a trampoline for it, which needs a working native
+;; compiler.  The tests bind this to nil so they never depend on one;
+;; the helper's calls from Lisp still see the advice.
+(defvar native-comp-enable-subr-trampolines)
+
+(defvar ws-test-curl--replaced nil
+  "Curl processes whose sentinel `ws-test-curl--without-sentinel' replaced.")
+
+(defun ws-test-curl--without-sentinel (make-process &rest args)
+  "Call MAKE-PROCESS with ARGS, ignoring the helper's curl sentinel."
+  (if (equal (plist-get args :name) "ws-test-curl")
+      (let ((proc (apply make-process
+                         (plist-put (copy-sequence args) :sentinel #'ignore))))
+        (push proc ws-test-curl--replaced)
+        proc)
+    (apply make-process args)))
+
+(ert-deftest ws/curl-helper-completes-without-sentinel ()
+  "The helper completes from curl's real exit, not from its sentinel.
+The sentinel of the helper's curl process is replaced with `ignore',
+so a helper that waits for its sentinel never returns; the outer
+bound turns that into a failure instead of a hang."
+  (ws-test-with
+      (lambda (request)
+        (with-slots (process) request
+          (ws-response-header process 200 '("Content-type" . "text/plain"))
+          (ws-send process "ok")))
+    (let ((ws-test-curl--replaced nil)
+          result)
+      (let ((native-comp-enable-subr-trampolines nil))
+        (advice-add 'make-process :around #'ws-test-curl--without-sentinel))
+      (unwind-protect
+          (setq result (ws-test-curl--bounded 3 (ws-test-curl-to-string "")))
+        (advice-remove 'make-process #'ws-test-curl--without-sentinel))
+      (should (= 1 (length ws-test-curl--replaced)))
+      (let ((proc (car ws-test-curl--replaced)))
+        (message "ws/curl-helper-completes-without-sentinel: %S %S %S"
+                 (process-sentinel proc) (process-status proc)
+                 (process-exit-status proc))
+        (should (eq #'ignore (process-sentinel proc)))
+        (should (eq 'exit (process-status proc)))
+        (should (zerop (process-exit-status proc))))
+      (should (equal '(:value "ok") result)))))
+
+(ert-deftest ws/curl-helper-deadline-fails-with-cleanup ()
+  "Curl or its stderr still open at the deadline fails the test promptly.
+In the first case the handler keeps the connection open without
+replying, so curl waits for its own -m 4.  In the second, a stand-in
+curl exits 0 while a background child holds its stderr open.  The
+same shorter deadline fails first with its phase, curl's status and
+the output so far, invents no exit status, and leaves no process or
+buffer of the helper behind."
+  (ws-test-with (lambda (_request) :keep-alive)
+    (let* ((ws-test-curl-deadline 0.5)
+           (start (float-time))
+           (err (should-error (ws-test-curl--bounded 6
+                                (ws-test-curl-to-string ""))
+                              :type 'ert-test-failed))
+           (data (cadr err)))
+      (should (< (- (float-time) start) 3))
+      (should (equal 0.5 (plist-get data :curl-timeout)))
+      (should (eq 'exit (plist-get data :phase)))
+      (should (eq 'run (plist-get data :status)))
+      (should (plist-member data :exit))
+      (should-not (plist-get data :exit))
+      (should-not (plist-member data :curl-exit))
+      (should (equal "" (plist-get data :stdout)))
+      (should (stringp (plist-get data :stderr)))
+      (should (string-match-p "curl -sS" (plist-get data :command)))
+      (should-not (ws-test-curl--leftovers))))
+  (ws-test-curl--with-stub
+      (concat "printf partial; printf 'stderr-open\\n' >&2\n"
+              "sleep 2 >/dev/null &\n"
+              "echo $! >>\"$WS_TEST_CURL_STUB/pids\"\n"
+              "exit 0\n")
+    (let* ((ws-test-curl-deadline 0.5)
+           (start (float-time))
+           (err (should-error (ws-test-curl--bounded 6
+                                (ws-test-curl-to-string ""))
+                              :type 'ert-test-failed))
+           (data (cadr err)))
+      (should (< (- (float-time) start) 1.5))
+      (should (equal 0.5 (plist-get data :curl-timeout)))
+      (should (eq 'stderr (plist-get data :phase)))
+      (should (eq 'exit (plist-get data :status)))
+      (should (eql 0 (plist-get data :exit)))
+      (should-not (plist-member data :curl-exit))
+      (should (string-prefix-p (plist-get data :stdout) "partial"))
+      (should (string-prefix-p (plist-get data :stderr) "stderr-open\n"))
+      (should-not (ws-test-curl--leftovers)))))
+
+(ert-deftest ws/curl-helper-returns-complete-body ()
+  "A body larger than a pipe buffer is returned complete, byte for byte.
+The outer bound keeps a helper that never completes from hanging."
+  (let ((body (mapconcat (lambda (i) (format "%07d\n" i))
+                         (number-sequence 0 24999) "")))
+    (should (= 200000 (length body)))
+    (ws-test-with
+        (lambda (request)
+          (with-slots (process) request
+            (ws-response-header process 200 '("Content-type" . "text/plain"))
+            (ws-send process body)))
+      (should (equal (list :value body)
+                     (ws-test-curl--bounded 6 (ws-test-curl-to-string "")))))))
+
+(ert-deftest ws/curl-helper-reports-complete-stderr ()
+  "A failing curl is reported with its complete stdout and stderr.
+The stand-in curl exits 7.  Its background job writes the end of
+stderr only after Emacs has seen that exit, so the report must keep
+reading stderr after curl is gone."
+  (ws-test-curl--with-stub
+      (concat "printf stdout-part; printf 'stderr-head\\n' >&2\n"
+              "(i=0\n"
+              " while [ ! -e \"$WS_TEST_CURL_STUB/exited\" ] && [ $i -lt 100 ]; do\n"
+              "   sleep 0.05; i=$((i+1))\n"
+              " done\n"
+              " [ -e \"$WS_TEST_CURL_STUB/exited\" ] && printf 'stderr-tail\\n' >&2\n"
+              ") >/dev/null &\n"
+              "echo $! >>\"$WS_TEST_CURL_STUB/pids\"\n"
+              "exit 7\n")
+    (let* ((exited (expand-file-name "exited" (getenv "WS_TEST_CURL_STUB")))
+           (timer (ws-test-curl--when-exited exited))
+           (err (unwind-protect
+                    (should-error (ws-test-curl--bounded 6
+                                    (ws-test-curl-to-string ""))
+                                  :type 'ert-test-failed)
+                  (cancel-timer timer)))
+           (data (cadr err)))
+      (should (eql 7 (plist-get data :curl-exit)))
+      (should (equal "stdout-part" (plist-get data :stdout)))
+      (should (equal "stderr-head\nstderr-tail\n" (plist-get data :stderr)))
+      (should (file-exists-p exited))
+      (should-not (ws-test-curl--leftovers)))))
 
 ;;; Deferred buffered responses
 
