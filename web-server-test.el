@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2021  Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target and raw query accessors.
+;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target, raw query and form-params accessors.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 
@@ -279,6 +279,83 @@ Framing matches the method case-insensitively, so the accessor does too."
     (should (equal "x=1" (ws-request-raw-query request)))
     (should (equal "/p?x=1" (ws-request-target request)))
     (should (equal '(1 3 2 3) (match-data)))))
+
+(defun ws-test-form-request (type body)
+  "Return a request parsed from a POST to /f?q=1 with TYPE and BODY."
+  (ws-test-parse-chunks
+   (format "POST /f?q=1 HTTP/1.1\r\nHost: h\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s"
+           type (string-bytes body) body)))
+
+(defconst ws-test-urlencoded-body "a=1&b=x+y&c=%2526&q=body"
+  "An urlencoded body whose key q collides with the query's.")
+
+(defconst ws-test-multipart-body
+  (concat "--XyZ\r\nContent-Disposition: form-data; name=\"t\"\r\n\r\nhello\r\n"
+          "--XyZ\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nw\303\251\r\n"
+          "--XyZ--\r\n")
+  "A two-part multipart body delimited by the boundary XyZ.")
+
+(ert-deftest ws/request-form-params-legacy-headers-unchanged ()
+  "Exposing the form params leaves the parsed header alist as it was.
+Both form media types still append their decoded forms after the query
+pairs and fields; this is compatibility, not an endorsement of it."
+  (should (equal '((:POST . "/f") ("q" . "1") (:HOST . "h")
+                   (:CONTENT-TYPE . "application/x-www-form-urlencoded")
+                   (:CONTENT-LENGTH . "24")
+                   ("q" . "body") ("c" . "%26") ("b" . "x y") ("a" . "1"))
+                 (cdr (ws-headers (ws-test-form-request
+                                   "application/x-www-form-urlencoded"
+                                   ws-test-urlencoded-body)))))
+  (should (equal '((:POST . "/f") ("q" . "1") (:HOST . "h")
+                   (:CONTENT-TYPE . "multipart/form-data; boundary=XyZ")
+                   (:CONTENT-LENGTH . "123")
+                   ("t" (content . "hello") (name . "t"))
+                   ("q" (content . "w\303\251") (name . "q")))
+                 (cdr (ws-headers (ws-test-form-request
+                                   "multipart/form-data; boundary=XyZ"
+                                   ws-test-multipart-body))))))
+
+(ert-deftest ws/request-form-params-urlencoded ()
+  "Urlencoded form params are the decoded pairs, the header alist's tail."
+  (let* ((request (ws-test-form-request "application/x-www-form-urlencoded"
+                                        ws-test-urlencoded-body))
+         (forms (ws-request-form-params request)))
+    (should (equal '(("q" . "body") ("c" . "%26") ("b" . "x y") ("a" . "1"))
+                   forms))
+    (should (eq forms (last (ws-headers request) (length forms))))))
+
+(ert-deftest ws/request-form-params-multipart ()
+  "Multipart form params are the parsed parts, the header alist's tail."
+  (let* ((request (ws-test-form-request "multipart/form-data; boundary=XyZ"
+                                        ws-test-multipart-body))
+         (forms (ws-request-form-params request)))
+    (should (equal '(("t" (content . "hello") (name . "t"))
+                     ("q" (content . "w\303\251") (name . "q")))
+                   forms))
+    (should (eq forms (last (ws-headers request) (length forms))))))
+
+(ert-deftest ws/request-form-params-non-form ()
+  "A request without form media has no form params."
+  (should-not (ws-request-form-params (make-instance 'ws-request)))
+  (should-not (ws-request-form-params
+               (ws-test-form-request "application/json" "{\"a\":1}")))
+  (should-not (ws-request-form-params
+               (ws-test-parse-chunks "GET /f?a=1 HTTP/1.1\r\nHost: h\r\n\r\n"))))
+
+(ert-deftest ws/request-form-params-partial ()
+  "Form params appear only once the complete request is decoded."
+  (let ((request (make-instance 'ws-request)))
+    (cl-flet ((feed (chunk)
+                (ws--frame-append request chunk)
+                (ws-parse-request request)))
+      (should-not (feed (concat "POST /f HTTP/1.1\r\nHost: h\r\n"
+                                "Content-Type: application/x-www-form-urlencoded\r\n"
+                                "Content-Length: 7\r\n\r\na=1")))
+      (should (ws-request-target request))
+      (should-not (ws-request-form-params request))
+      (should (feed "&b=2"))
+      (should (equal '(("b" . "2") ("a" . "1"))
+                     (ws-request-form-params request))))))
 
 (ert-deftest ws/parse-post-data ()
   (let ((server (ws-start nil ws-test-port))

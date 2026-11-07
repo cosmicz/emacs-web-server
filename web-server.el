@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2014 Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target and raw query.
+;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target, raw query and decoded form params.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 ;; Maintainer: Eric Schulte <schulte.eric@gmail.com>
@@ -77,6 +77,7 @@
    (frame-length :accessor ws-frame-length :initform nil)
    (frame-request-line :accessor ws-frame-request-line :initform nil)
    (frame-fields :accessor ws-frame-fields :initform nil)
+   (frame-form-params :accessor ws-frame-form-params :initform nil)
    (frame-deadline :accessor ws-frame-deadline :initform nil)
    (responder :initarg :responder :accessor ws-request-responder
               :initform nil)))
@@ -714,6 +715,7 @@ unbounded copy of that argument merely to discover it must be refused."
                         (when part (push part parts)))
                       (setq start (+ next 4 (length boundary))))))
                 (nreverse parts))))))
+      (setf (ws-frame-form-params request) forms)
       (setcdr (last (ws-headers request)) forms))))
 
 (defun ws-parse-request (request)
@@ -766,6 +768,15 @@ The caller's match data is preserved."
       (save-match-data
         (when (string-match "\\?" target)
           (substring target (match-end 0)))))))
+
+(defun ws-request-form-params (request)
+  "Return the form params decoded from REQUEST's body, or nil.
+For an urlencoded body they are the decoded (NAME . VALUE) pairs; for a
+multipart body the parsed parts.  It is the same list that is appended
+to the header alist, not a copy, so nothing is parsed here.  It is nil
+until the complete request has been decoded and when the media type is
+not a form type.  The request owns the list; callers must not modify it."
+  (ws-frame-form-params request))
 
 (defun ws-call-handler (request handlers)
   (catch 'matched-handler
