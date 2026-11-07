@@ -5,6 +5,7 @@ NOTES
 README
 stuff
 web-server-test.el
+web-server-lifetime-test.el
 
 ## Ignorable documentation files
 doc/dir

@@ -1,7 +1,7 @@
                            Emacs Web Server
 
     Copyright (C) 2026 OC (cosmicz@github)
-    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure.
+    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure. Also document DISPATCHED REQUEST LIFETIME.
 
 DESCRIPTION
     A web server in Emacs running handlers written in Emacs Lisp.
@@ -62,6 +62,22 @@ REQUEST FRAMING
 
     Complete-body framing reimplements the idea discussed in upstream PR #31
     (dickmao) for all content types and octets; that patch is not imported.
+
+DISPATCHED REQUEST LIFETIME
+    A complete non-deferred handler returning :keep-alive (or throwing it
+    to close-connection) retains its request while the connection is live.
+    After the handler returns, a sentinel prunes that exact request on TCP
+    close, including WebSocket upgrades that replace the process plist.
+    Deferred responders and incomplete framing retain their own sentinels.
+    WebSocket CLOSE-frame protocol behavior is unchanged.
+
+    A sentinel installed by the handler receives its actual events; terminal
+    detachment happens before that callback. A caller replacing the sentinel
+    afterward must chain the captured prior sentinel to retain this cleanup.
+    ws-stop detaches all requests, including already-dead entries, before
+    closing callbacks and completes pending responders as stopped once.
+    Caller-held request objects remain usable. This is collection pruning,
+    not a garbage-collection guarantee or a general memory bound.
 
 USAGE
     See the examples/ directory in this repository for examples

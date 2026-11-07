@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2014 Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target, raw query and decoded form params.
+;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target, raw query and decoded form params. Also prune dispatched keep-alive and WebSocket requests on peer close and stop.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 ;; Maintainer: Eric Schulte <schulte.eric@gmail.com>
@@ -178,21 +178,24 @@ function.
 (defun ws-stop (server)
   "Stop SERVER.
 Pending deferred responders end as `stopped' before their connections
-are deleted."
+are deleted.  Detach all requests before closing callbacks run."
   (setf (ws-frame-stopped server) t)
-  (let ((snapshot nil))
+  (let ((requests (copy-sequence (ws-requests server)))
+        (snapshot nil))
+    ;; Reentrant callbacks must see the stopped state, including dead entries.
+    (setf (ws-requests server) nil)
+    (setq ws-servers (delq server ws-servers))
     (maphash (lambda (proc entry) (push (cons proc entry) snapshot))
              (ws-frame-connections server))
     (dolist (pair snapshot)
       (when (eq (cdr pair) (gethash (car pair) (ws-frame-connections server)))
-        (ws--frame-close server (car pair) (ws--frame-entry-prior (cdr pair))))))
-  (setq ws-servers (remove server ws-servers))
-  (dolist (request (copy-sequence (ws-requests server)))
-    (let ((responder (ws-request-responder request)))
-      (when responder
-        (ws--responder-finish responder 'stopped))))
-  (mapc #'delete-process (append (mapcar #'ws-process (ws-requests server))
-                                 (list (ws-process server)))))
+        (ws--frame-close server (car pair) (ws--frame-entry-prior (cdr pair)))))
+    (dolist (request requests)
+      (let ((responder (ws-request-responder request)))
+        (when responder
+          (ws--responder-finish responder 'stopped))))
+    (dolist (proc (append (mapcar #'ws-process requests) (list (ws-process server))))
+      (when (process-live-p proc) (delete-process proc)))))
 
 (defun ws-stop-all ()
   "Stop all servers in `ws-servers'."
@@ -299,13 +302,63 @@ are deleted."
                   (ws--responder-finish responder 'failed))
                  ;; The handler deferred: keep the connection for `ws-respond'.
                  (responder nil)
-                 ((eq result :keep-alive) nil)
+                 ((eq result :keep-alive)
+                  (when (eq (ws-frame-state request) 'complete)
+                    (ws--watch-request server request)))
                  (t
                   ;; Properly shut down processes requiring an ending (e.g., chunked)
                   (let ((ender (plist-get (process-plist proc) :ender)))
                     (when ender (process-send-string proc ender)))
                   (setq requests (cl-remove-if (lambda (r) (eql proc (ws-process r))) requests))
                   (delete-process proc)))))))))))
+
+(defun ws--prune-request (server request)
+  "Detach exactly REQUEST from SERVER without invalidating the object."
+  (setf (ws-requests server) (delq request (ws-requests server))))
+
+(defun ws--watch-request (server request)
+  "Prune dispatched REQUEST from SERVER when its connection closes.
+Capture ownership after the handler, independently of the process plist.
+Caller sentinels receive their actual events after terminal detachment."
+  (let* ((proc (ws-process request))
+         (prior (process-sentinel proc))
+         (wrapper nil)
+         (finished nil)
+         (success nil))
+    (if (not (process-live-p proc))
+        ;; A yielding handler may already have delivered the terminal event.
+        (ws--prune-request server request)
+      (setq wrapper
+            (lambda (process event)
+              (cond
+               ((process-live-p process)
+                (when prior (funcall prior process event)))
+               ((not finished)
+                (setq finished t)
+                (ws--prune-request server request)
+                (when (eq wrapper (process-sentinel process))
+                  (set-process-sentinel process prior))
+                (when prior (funcall prior process event))))))
+      (unwind-protect
+          (progn
+            (set-process-sentinel proc wrapper)
+            ;; EOF can land between the first liveness check and installation.
+            (unless (process-live-p proc)
+              (setq finished t)
+              (ws--prune-request server request)
+              (when (eq wrapper (process-sentinel proc))
+                (set-process-sentinel proc prior)))
+            (setq success t))
+        (unless success
+          (ws--prune-request server request)
+          ;; Cleanup cannot replace the original setup error or quit.
+          (condition-case nil
+              (when (eq wrapper (process-sentinel proc))
+                (set-process-sentinel proc prior))
+            ((error quit) nil))
+          (condition-case nil
+              (when (process-live-p proc) (delete-process proc))
+            ((error quit) nil)))))))
 
 ;;; Deferred buffered responses
 
@@ -840,10 +893,10 @@ not a form type.  The request owns the list; callers must not modify it."
    (handler  :initarg :handler  :accessor ws-handler  :initform "")))
 
 (defun ws-web-socket-connect (request handler)
-  "Establish a web socket connection with request.
-If the connection is successful this function will throw
-`:keep-alive' to `close-connection' skipping any remaining code
-in the request handler.  If no web-socket connection is
+  "Establish a web socket connection with REQUEST.
+On success return its process; the handler must return `:keep-alive'
+or throw it to `close-connection' to retain the connection.
+If no web-socket connection is
 established (e.g., because REQUEST is not attempting to establish
 a connection) then no actions are taken and nil is returned.
 
