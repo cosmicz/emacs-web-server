@@ -344,4 +344,97 @@ Content-Type: application/octet-stream
     (gzipper "Content-Encoding")
     (gzipper "Transfer-Encoding")))
 
+;;; Connection log
+
+;; Emacs calls a server's :log function with the listening process, the
+;; accepted client and a message.  When accept itself fails, the client
+;; is nil.  See server_accept_connection in Emacs' src/process.c.
+;; These tests call the callback that `ws-start' installed, so they cover
+;; the exact function Emacs calls.
+
+(defvar ws-test-log--clients nil
+  "Client processes opened by the current log test, for cleanup.")
+
+(defun ws-test-log--port (server)
+  "Return the port SERVER actually listens on."
+  (process-contact (ws-process server) :service))
+
+(defun ws-test-log--wait (pred &optional seconds)
+  "Process events until PRED is non-nil or SECONDS (default 5) elapse.
+Return PRED's final value; never depends on a fixed sleep."
+  (let ((deadline (+ (float-time) (or seconds 5)))
+        (value nil))
+    (while (and (not (setq value (funcall pred)))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.05))
+    value))
+
+(defun ws-test-log--client (port &optional text)
+  "Open a raw client to PORT, send TEXT, and return the client process.
+The client discards its input and is registered for cleanup by
+`ws-test-log--with'."
+  (let ((proc (open-network-stream "ws-test-log-client" nil
+                                   "127.0.0.1" port)))
+    (push proc ws-test-log--clients)
+    (set-process-query-on-exit-flag proc nil)
+    (set-process-filter proc #'ignore)
+    (when text (process-send-string proc text))
+    proc))
+
+(defun ws-test-log--get (path)
+  "Return a minimal HTTP/1.1 GET request for PATH."
+  (format "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" path))
+
+(defmacro ws-test-log--with (var log &rest body)
+  "Run BODY with server VAR on an ephemeral port, logging to buffer LOG.
+LOG is a buffer name, or nil for a server started without logging.
+The server, the log buffer and every client opened through
+`ws-test-log--client' are cleaned up even when an assertion fails."
+  (declare (indent 2))
+  `(let ((ws-test-log--clients nil)
+         (,var (ws-start #'ignore 0 ,log)))
+     (unwind-protect (progn ,@body)
+       (mapc (lambda (p) (when (process-live-p p) (delete-process p)))
+             ws-test-log--clients)
+       (when (memq ,var ws-servers) (ws-stop ,var))
+       (when (and ,log (get-buffer ,log)) (kill-buffer ,log)))))
+
+(defun ws-test-log--text (log)
+  "Return the contents of the log buffer named LOG."
+  (with-current-buffer log (buffer-string)))
+
+(ert-deftest ws/log-accept-failure-without-client ()
+  "An accept failure, reported with a nil client, logs one line.
+The line holds the time, nil for the client host and port, and Emacs'
+message; the callback signals nothing."
+  (let ((log (generate-new-buffer-name " *ws-test-log*")))
+    (ws-test-log--with server log
+      (let ((callback (process-contact (ws-process server) :log)))
+        (should (functionp callback))
+        (funcall callback (ws-process server) nil "accept failed with code24\n")
+        (should (string-match-p
+                 "\\`[^\t\n]+\tnil\tnil\taccept failed with code24\n\\'"
+                 (ws-test-log--text log)))))))
+
+(ert-deftest ws/log-accepted-client ()
+  "An accepted client is logged once with its host and port.
+The client sends a request so the server handles the connection and
+closes it; by then every line for it has been logged."
+  (let ((log (generate-new-buffer-name " *ws-test-log*")))
+    (ws-test-log--with server log
+      (let* ((client (ws-test-log--client (ws-test-log--port server)
+                                          (ws-test-log--get "/")))
+             (port (aref (process-contact client :local) 4)))
+        (should (ws-test-log--wait (lambda () (not (process-live-p client)))))
+        (should (string-match-p
+                 (format "\\`[^\t\n]+\t127\\.0\\.0\\.1\t%d\taccept from 127\\.0\\.0\\.1\n\\'"
+                         port)
+                 (ws-test-log--text log)))))))
+
+(ert-deftest ws/log-disabled-installs-no-callback ()
+  "Without a log buffer, `ws-start' installs no :log callback."
+  (ws-test-log--with server nil
+    (should-not (process-contact (ws-process server) :log))
+    (should-not (plist-member (process-plist (ws-process server)) :log-buffer))))
+
 (provide 'web-server-test)
