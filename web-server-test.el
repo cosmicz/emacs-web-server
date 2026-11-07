@@ -1,6 +1,8 @@
 ;;; web-server-test.el --- Test the Emacs Web Server  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2013-2021  Free Software Foundation, Inc.
+;; Copyright (C) 2026 OC (cosmicz@github)
+;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 

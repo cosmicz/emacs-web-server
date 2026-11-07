@@ -1,4 +1,5 @@
 ;;; web-server-frame-test.el --- Octet framing contract -*- lexical-binding: t; -*-
+;; Copyright (C) 2026 OC (cosmicz@github)
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 ;; Complete framing and bounded admission regression controls.
 (require 'web-server-test)

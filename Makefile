@@ -1,3 +1,6 @@
+# Copyright (C) 2026 OC (cosmicz@github)
+# Modified by OC (cosmicz@github), 2026: Run framing regression tests and exclude them from package archives.
+
 EMACS := emacs
 BATCH=$(EMACS) --batch --execute '(add-to-list (quote load-path) "$(shell pwd)")'
 

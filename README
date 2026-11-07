@@ -1,5 +1,8 @@
                            Emacs Web Server
 
+    Copyright (C) 2026 OC (cosmicz@github)
+    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure.
+
 DESCRIPTION
     A web server in Emacs running handlers written in Emacs Lisp.
 
