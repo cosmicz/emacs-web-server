@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2021  Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target, raw query and form-params accessors.
+;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target, raw query and form-params accessors. Observe framing errors through the private request context.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 
@@ -248,7 +248,7 @@ Fail unless framing refuses it.  Without a process no reply is written."
   "A method outside `ws-http-common-methods' is refused with no target."
   (let ((request (ws-test-refused-head
                   "PATCH /p?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")))
-    (should (equal 400 (ws-frame-error request)))
+    (should (equal 400 (ws--frame-request-error (ws--frame-request-context request))))
     (should-not (ws-request-target request))
     (should-not (ws-request-raw-query request))))
 
@@ -258,7 +258,7 @@ A second request-line-shaped line is not a field line, so framing refuses
 the whole head; the first line's target must not survive that."
   (let ((request (ws-test-refused-head
                   "GET /p?a=1 HTTP/1.1\r\nGET /other?x=1 HTTP/1.1\r\n\r\n")))
-    (should (equal 400 (ws-frame-error request)))
+    (should (equal 400 (ws--frame-request-error (ws--frame-request-context request))))
     (should-not (ws-request-target request))
     (should-not (ws-request-raw-query request))))
 

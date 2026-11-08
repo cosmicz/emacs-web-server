@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2014 Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target, raw query and decoded form params. Also prune dispatched keep-alive and WebSocket requests on peer close and stop.
+;; Modified by OC (cosmicz@github), 2026: Add one-shot deferred replies, accept-failure logging, and bounded byte-framed request dispatch; expose the raw request-target, raw query and decoded form params. Also prune dispatched keep-alive and WebSocket requests on peer close and stop. Group framing ownership into private records and remove unsupported ws-frame-* accessors.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 ;; Maintainer: Eric Schulte <schulte.eric@gmail.com>
@@ -51,15 +51,31 @@
 (require 'eieio)
 (require 'cl-lib)
 
+;;; Private framing ownership.  Contexts outlive registry membership.
+(cl-defstruct (ws--frame-limits (:constructor ws--frame-limits-create))
+  "Validated limits shared without mutation by a server and its requests."
+  (body nil :read-only t) (header nil :read-only t)
+  (timeout nil :read-only t) (incomplete-cap nil :read-only t))
+
+(cl-defstruct (ws--frame-server (:constructor ws--frame-server-create))
+  "Admission registry and server fence, separate from request parse state."
+  limits (connections (make-hash-table :test #'eq)) (sequence 0) stopped)
+
+(cl-defstruct (ws--frame-message (:constructor ws--frame-message-create))
+  "Accepted HEAD and, after decoding, the borrowed legacy form-list tail."
+  (request-line nil :read-only t) (fields nil :read-only t) form-params)
+
+(cl-defstruct (ws--frame-request (:constructor ws--frame-request-create))
+  "Request progress and sole first-input deadline, retained after release."
+  state limits error header-end length deadline message)
+
 (defclass ws-server ()
   ((handlers :initarg :handlers :accessor ws-handlers :initform nil)
    (process  :initarg :process  :accessor ws-process  :initform nil)
    (port     :initarg :port     :accessor ws-port     :initform nil)
    (requests :initarg :requests :accessor ws-requests :initform nil)
-   (frame-settings :accessor ws-frame-settings :initform nil)
-   (frame-connections :accessor ws-frame-connections :initform (make-hash-table :test #'eq))
-   (frame-sequence :accessor ws-frame-sequence :initform 0)
-   (frame-stopped :accessor ws-frame-stopped :initform nil)))
+   (ws--frame-context :accessor ws--frame-server-context
+                      :initform (funcall #'ws--frame-server-create))))
 
 (defclass ws-request ()
   ((process  :initarg :process  :accessor ws-process  :initform nil)
@@ -70,15 +86,8 @@
    (active   :initarg :active   :accessor ws-active   :initform nil)
    (headers  :initarg :headers  :accessor ws-headers  :initform (list nil))
    (body     :initarg :body     :accessor ws-body     :initform "")
-   (frame-state :accessor ws-frame-state :initform nil)
-   (frame-limits :accessor ws-frame-limits :initform nil)
-   (frame-error :accessor ws-frame-error :initform nil)
-   (frame-header-end :accessor ws-frame-header-end :initform nil)
-   (frame-length :accessor ws-frame-length :initform nil)
-   (frame-request-line :accessor ws-frame-request-line :initform nil)
-   (frame-fields :accessor ws-frame-fields :initform nil)
-   (frame-form-params :accessor ws-frame-form-params :initform nil)
-   (frame-deadline :accessor ws-frame-deadline :initform nil)
+   (ws--frame-context :accessor ws--frame-request-context
+                      :initform (funcall #'ws--frame-request-create))
    (responder :initarg :responder :accessor ws-request-responder
               :initform nil)))
 
@@ -156,7 +165,7 @@ function.
   (let* ((settings (ws--frame-settings))
          (server (make-instance 'ws-server :handlers handlers :port port))
          (log (when log-buffer (get-buffer-create log-buffer))))
-    (setf (ws-frame-settings server) settings)
+    (setf (ws--frame-server-limits (ws--frame-server-context server)) settings)
     (setf (ws-process server)
           (apply
            #'make-network-process
@@ -179,16 +188,16 @@ function.
   "Stop SERVER.
 Pending deferred responders end as `stopped' before their connections
 are deleted.  Detach all requests before closing callbacks run."
-  (setf (ws-frame-stopped server) t)
+  (setf (ws--frame-server-stopped (ws--frame-server-context server)) t)
   (let ((requests (copy-sequence (ws-requests server)))
         (snapshot nil))
     ;; Reentrant callbacks must see the stopped state, including dead entries.
     (setf (ws-requests server) nil)
     (setq ws-servers (delq server ws-servers))
     (maphash (lambda (proc entry) (push (cons proc entry) snapshot))
-             (ws-frame-connections server))
+             (ws--frame-server-connections (ws--frame-server-context server)))
     (dolist (pair snapshot)
-      (when (eq (cdr pair) (gethash (car pair) (ws-frame-connections server)))
+      (when (eq (cdr pair) (gethash (car pair) (ws--frame-server-connections (ws--frame-server-context server))))
         (ws--frame-close server (car pair) (ws--frame-entry-prior (cdr pair)))))
     (dolist (request requests)
       (let ((responder (ws-request-responder request)))
@@ -275,7 +284,7 @@ are deleted.  Detach all requests before closing callbacks run."
 
 (defun ws-filter (proc string)
   (let ((server (process-get proc :server)))
-    (when (and (process-live-p proc) (not (ws-frame-stopped server)))
+    (when (and (process-live-p proc) (not (ws--frame-server-stopped (ws--frame-server-context server))))
       (with-slots (handlers requests) (plist-get (process-plist proc) :server)
         (unless (cl-find-if (lambda (c) (equal proc (ws-process c))) requests)
           (push (make-instance 'ws-request :process proc) requests))
@@ -303,7 +312,7 @@ are deleted.  Detach all requests before closing callbacks run."
                  ;; The handler deferred: keep the connection for `ws-respond'.
                  (responder nil)
                  ((eq result :keep-alive)
-                  (when (eq (ws-frame-state request) 'complete)
+                  (when (eq (ws--frame-request-state (ws--frame-request-context request)) 'complete)
                     (ws--watch-request server request)))
                  (t
                   ;; Properly shut down processes requiring an ending (e.g., chunked)
@@ -484,7 +493,7 @@ state only, not deferred, streaming, WebSocket or kernel-backlog lifetimes.")
 (put 'ws-request-setting-error 'error-message "Invalid request framing setting")
 
 (defun ws--frame-settings ()
-  "Validate and return the current body/header/time configuration."
+  "Validate once and return frozen named body/header/time/admission limits."
   (unless (and (integerp ws-request-body-limit) (>= ws-request-body-limit 0))
     (signal 'ws-request-setting-error '(ws-request-body-limit)))
   (unless (and (integerp ws-request-header-limit) (> ws-request-header-limit 0))
@@ -496,14 +505,15 @@ state only, not deferred, streaming, WebSocket or kernel-backlog lifetimes.")
     (signal 'ws-request-setting-error '(ws-request-framing-timeout)))
   (unless (and (integerp ws-request-incomplete-limit) (> ws-request-incomplete-limit 0))
     (signal 'ws-request-setting-error '(ws-request-incomplete-limit)))
-  (list ws-request-body-limit ws-request-header-limit ws-request-framing-timeout
-        ws-request-incomplete-limit))
+  (ws--frame-limits-create :body ws-request-body-limit :header ws-request-header-limit
+                          :timeout ws-request-framing-timeout
+                          :incomplete-cap ws-request-incomplete-limit))
 
 
 ;;; Bounded admission and request framing lifetime.
 
 (cl-defstruct (ws--frame-entry (:constructor ws--frame-entry-create))
-  admitted deadline request prior sentinel order)
+  admitted request prior sentinel order)
 
 (defun ws--frame-now ()
   "Return the framing clock in seconds; isolated for deterministic tests."
@@ -513,13 +523,13 @@ state only, not deferred, streaming, WebSocket or kernel-backlog lifetimes.")
   "Release PROC's incomplete entry on SERVER once, before any socket close.
 When DISCARD is non-nil also detach its incomplete request.  A stale release
 cannot release another process's entry.  Return the removed entry or nil."
-  (let* ((table (ws-frame-connections server)) (entry (gethash proc table)))
+  (let* ((table (ws--frame-server-connections (ws--frame-server-context server))) (entry (gethash proc table)))
     (when entry
       ;; delete-process can synchronously dispatch other filters and sentinels.
       (remhash proc table)
       (let ((request (ws--frame-entry-request entry)))
         (when (and discard request)
-          (setf (ws-frame-state request) 'retired
+          (setf (ws--frame-request-state (ws--frame-request-context request)) 'retired
                 (ws-requests server) (delq request (ws-requests server)))))
       (when (eq (process-sentinel proc) (ws--frame-entry-sentinel entry))
         (set-process-sentinel proc (ws--frame-entry-prior entry)))
@@ -534,7 +544,8 @@ cannot release another process's entry.  Return the removed entry or nil."
 (defun ws--frame-reclaim (server)
   "Reclaim expired incomplete sockets from a stable admission-order snapshot.
 Recheck membership and dispatch state after each potentially reentrant close."
-  (let ((snapshot nil) (table (ws-frame-connections server)))
+  (let* ((frame (ws--frame-server-context server))
+         (snapshot nil) (table (ws--frame-server-connections frame)))
     (maphash (lambda (proc entry) (push (cons proc entry) snapshot)) table)
     (setq snapshot
           (sort snapshot (lambda (a b) (< (ws--frame-entry-order (cdr a))
@@ -542,12 +553,14 @@ Recheck membership and dispatch state after each potentially reentrant close."
     (dolist (pair snapshot)
       (let* ((proc (car pair)) (entry (cdr pair))
              (request (ws--frame-entry-request entry)))
-        (when (and (not (ws-frame-stopped server)) (eq entry (gethash proc table))
+        (when (and (not (ws--frame-server-stopped frame)) (eq entry (gethash proc table))
                    (or (null request) (ws--frame-waiting-p request))
                    (>= (ws--frame-now)
-                       (or (ws--frame-entry-deadline entry)
-                           (+ (ws--frame-entry-admitted entry)
-                              (nth 2 (ws-frame-settings server))))))
+                       (if request
+                           (ws--frame-request-deadline (ws--frame-request-context request))
+                         (+ (ws--frame-entry-admitted entry)
+                            (ws--frame-limits-timeout
+                             (ws--frame-server-limits frame))))))
           (ws--frame-close server proc (ws--frame-entry-prior entry)))))))
 
 (defun ws--frame-admit (server proc)
@@ -558,21 +571,21 @@ and closes the peer; errors are contained by the enclosing log callback."
     (unwind-protect
         (progn
           (setq prior (process-sentinel proc))
-          (unless (ws-frame-stopped server) (ws--frame-reclaim server))
+          (unless (ws--frame-server-stopped (ws--frame-server-context server)) (ws--frame-reclaim server))
           ;; Reclamation may have stopped the server or admitted another peer.
-          (when (and (not (ws-frame-stopped server)) (process-live-p proc)
-                     (< (hash-table-count (ws-frame-connections server))
-                        (nth 3 (ws-frame-settings server))))
+          (when (and (not (ws--frame-server-stopped (ws--frame-server-context server))) (process-live-p proc)
+                     (< (hash-table-count (ws--frame-server-connections (ws--frame-server-context server)))
+                        (ws--frame-limits-incomplete-cap (ws--frame-server-limits (ws--frame-server-context server)))))
             (let* ((entry (ws--frame-entry-create
                            :admitted (ws--frame-now) :prior prior
-                           :order (cl-incf (ws-frame-sequence server))))
+                           :order (cl-incf (ws--frame-server-sequence (ws--frame-server-context server)))))
                    (sentinel
                     (lambda (p event)
                       (unless (process-live-p p) (ws--frame-release server p t))
                       ;; In particular, live "open from" does not release.
                       (when prior (funcall prior p event)))))
               (setf (ws--frame-entry-sentinel entry) sentinel)
-              (puthash proc entry (ws-frame-connections server))
+              (puthash proc entry (ws--frame-server-connections (ws--frame-server-context server)))
               (set-process-sentinel proc sentinel)
               (setq committed t)))
           committed)
@@ -603,7 +616,7 @@ Optional log write failure never revokes an otherwise committed admission."
 
 (defun ws--frame-waiting-p (request)
   "Return non-nil while REQUEST still owns an incomplete frame."
-  (memq (ws-frame-state request) '(headers body)))
+  (memq (ws--frame-request-state (ws--frame-request-context request)) '(headers body)))
 
 (defun ws--frame-retire (request)
   "Release REQUEST's framing admission before dispatch or normal refusal."
@@ -622,15 +635,15 @@ A successful write is not proof of delivery.  Callers retire even on failure."
 
 (defun ws--frame-begin (request)
   "Capture REQUEST's framing settings and fixed deadline at its first input."
-  (let* ((proc (ws-process request)) (server (and proc (process-get proc :server)))
-         (settings (if server (ws-frame-settings server) (ws--frame-settings)))
-         (entry (and server (gethash proc (ws-frame-connections server)))))
-    (setf (ws-frame-state request) 'headers (ws-frame-limits request) settings)
+  (let* ((frame (ws--frame-request-context request))
+         (proc (ws-process request)) (server (and proc (process-get proc :server)))
+         (settings (if server (ws--frame-server-limits (ws--frame-server-context server)) (ws--frame-settings)))
+         (entry (and server (gethash proc (ws--frame-server-connections (ws--frame-server-context server))))))
+    (setf (ws--frame-request-state frame) 'headers (ws--frame-request-limits frame) settings)
     (when proc
-      (setf (ws-frame-deadline request) (+ (ws--frame-now) (nth 2 settings)))
+      (setf (ws--frame-request-deadline frame) (+ (ws--frame-now) (ws--frame-limits-timeout settings)))
       (when entry
-        (setf (ws--frame-entry-request entry) request
-              (ws--frame-entry-deadline entry) (ws-frame-deadline request))))))
+        (setf (ws--frame-entry-request entry) request)))))
 
 (defconst ws--frame-token "[!#$%&'*+.^_`|~0-9A-Za-z-]+"
   "HTTP field-name and transfer-coding token pattern.")
@@ -664,7 +677,8 @@ strings before integer conversion, including arbitrarily many leading zeroes."
 Defer request/query/auth and content decoding until the complete frame.
 Return a refusal code or nil."
   (catch 'refusal
-    (let* ((lines (split-string (substring head 0 (- (length head) 4)) "\r\n"))
+    (let* ((frame (ws--frame-request-context request))
+           (lines (split-string (substring head 0 (- (length head) 4)) "\r\n"))
            (request-line (pop lines)) (fields nil) (case-fold-search t))
       (unless (and request-line (string-match ws-http-method-rx request-line))
         (throw 'refusal 400))
@@ -684,12 +698,12 @@ Return a refusal code or nil."
         (when codings
           (throw 'refusal (if (ws--frame-transfer-p (cdar codings)) 501 400)))
         (let ((size (if lengths
-                        (ws--frame-length (cdar lengths) (car (ws-frame-limits request)))
+                        (ws--frame-length (cdar lengths) (ws--frame-limits-body (ws--frame-request-limits frame)))
                       '(0))))
           (when (numberp size) (throw 'refusal size))
-          (setf (ws-frame-length request) (car size))))
-      (setf (ws-frame-request-line request) request-line
-            (ws-frame-fields request) fields)
+          (setf (ws--frame-request-length frame) (car size))))
+      (setf (ws--frame-request-message frame)
+            (ws--frame-message-create :request-line request-line :fields fields))
       nil)))
 
 (defun ws--frame-header-end (old input)
@@ -707,46 +721,48 @@ Return its end offset in their conceptual concatenation, or nil."
   "Append only budget-checked octets of INPUT to incomplete REQUEST.
 A filter argument has already been allocated by Emacs; never make an
 unbounded copy of that argument merely to discover it must be refused."
-  (unless (ws-frame-state request) (ws--frame-begin request))
-  (when (and (ws--frame-waiting-p request) (multibyte-string-p input))
-    (setf (ws-frame-error request) 400))
-  (when (and (ws--frame-waiting-p request) (not (ws-frame-error request)))
-    (if (and (ws-frame-deadline request)
-             (>= (ws--frame-now) (ws-frame-deadline request)))
-        (setf (ws-frame-error request) 408)
-      (let ((pending (ws-pending request)) (body-input input))
-        (when (eq (ws-frame-state request) 'headers)
-          (let ((end (ws--frame-header-end pending input))
-                (limit (nth 1 (ws-frame-limits request))))
-            (cond
-             ((or (and end (> end limit))
-                  (and (not end) (> (+ (length pending) (length input)) limit)))
-              (setf (ws-frame-error request) 431))
-             (end
-              (let* ((used (- end (length pending)))
-                     (head (concat pending (substring input 0 used))))
-                (setf (ws-frame-error request) (ws--frame-read-head request head)
-                      (ws-pending request) head
-                      (ws-frame-header-end request) end
-                      (ws-frame-state request) 'body)
-                ;; Check the rest BEFORE making its substring or concatenation.
-                (if (> (- (length input) used) (or (ws-frame-length request) 0))
-                    (unless (ws-frame-error request) (setf (ws-frame-error request) 400))
-                  (unless (ws-frame-error request)
-                    (setq body-input (substring input used))))))
-             (t (setf (ws-pending request) (concat pending input))))))
-        (when (and (eq (ws-frame-state request) 'body) (not (ws-frame-error request)))
-          (if (> (+ (- (length (ws-pending request)) (ws-frame-header-end request))
-                    (length body-input)) (ws-frame-length request))
-              (setf (ws-frame-error request) 400)
-            (setf (ws-pending request) (concat (ws-pending request) body-input))))))))
+  (let ((frame (ws--frame-request-context request)))
+    (unless (ws--frame-request-state frame) (ws--frame-begin request))
+    (when (and (ws--frame-waiting-p request) (multibyte-string-p input))
+      (setf (ws--frame-request-error frame) 400))
+    (when (and (ws--frame-waiting-p request) (not (ws--frame-request-error frame)))
+      (if (and (ws--frame-request-deadline frame)
+               (>= (ws--frame-now) (ws--frame-request-deadline frame)))
+          (setf (ws--frame-request-error frame) 408)
+        (let ((pending (ws-pending request)) (body-input input))
+          (when (eq (ws--frame-request-state frame) 'headers)
+            (let ((end (ws--frame-header-end pending input))
+                  (limit (ws--frame-limits-header (ws--frame-request-limits frame))))
+              (cond
+               ((or (and end (> end limit))
+                    (and (not end) (> (+ (length pending) (length input)) limit)))
+                (setf (ws--frame-request-error frame) 431))
+               (end
+                (let* ((used (- end (length pending)))
+                       (head (concat pending (substring input 0 used))))
+                  (setf (ws--frame-request-error frame) (ws--frame-read-head request head)
+                        (ws-pending request) head
+                        (ws--frame-request-header-end frame) end
+                        (ws--frame-request-state frame) 'body)
+                  ;; Check the rest BEFORE making its substring or concatenation.
+                  (if (> (- (length input) used) (or (ws--frame-request-length frame) 0))
+                      (unless (ws--frame-request-error frame) (setf (ws--frame-request-error frame) 400))
+                    (unless (ws--frame-request-error frame)
+                      (setq body-input (substring input used))))))
+               (t (setf (ws-pending request) (concat pending input))))))
+          (when (and (eq (ws--frame-request-state frame) 'body) (not (ws--frame-request-error frame)))
+            (if (> (+ (- (length (ws-pending request)) (ws--frame-request-header-end frame))
+                      (length body-input)) (ws--frame-request-length frame))
+                (setf (ws--frame-request-error frame) 400)
+              (setf (ws-pending request) (concat (ws-pending request) body-input)))))))))
 
 (defun ws--frame-decode (request)
   "Decode the already complete REQUEST once, preserving its exact raw body."
-  (let* ((proc (ws-process request)) (fields (ws-frame-fields request))
+  (let* ((message (ws--frame-request-message (ws--frame-request-context request)))
+         (proc (ws-process request)) (fields (ws--frame-message-fields message))
          (type (cdr (assq :CONTENT-TYPE fields))) (case-fold-search t))
     (setf (ws-headers request)
-          (cons nil (append (ws-parse proc (ws-frame-request-line request))
+          (cons nil (append (ws-parse proc (ws--frame-message-request-line message))
                             (cl-mapcan (lambda (field)
                                          (if (eq (car field) :AUTHORIZATION)
                                              (ws-parse proc (concat "Authorization: " (cdr field)))
@@ -768,33 +784,34 @@ unbounded copy of that argument merely to discover it must be refused."
                         (when part (push part parts)))
                       (setq start (+ next 4 (length boundary))))))
                 (nreverse parts))))))
-      (setf (ws-frame-form-params request) forms)
+      (setf (ws--frame-message-form-params message) forms)
       (setcdr (last (ws-headers request)) forms))))
 
 (defun ws-parse-request (request)
   "Parse REQUEST only after one complete, bounded Content-Length frame.
 Wait without decoding partial forms.  Raw body bytes are never trimmed."
-  ;; Legacy direct parser callers supply pending, without a socket/filter.
-  (unless (ws-frame-state request)
-    (let ((input (ws-pending request)))
-      (setf (ws-pending request) "")
-      (ws--frame-append request input)))
-  (when (ws-frame-error request)
-    (ws--frame-retire request)
-    (setf (ws-frame-state request) 'retired)
-    (ws--frame-send request (ws-frame-error request))
-    (throw 'close-connection nil))
-  (if (and (eq (ws-frame-state request) 'body)
-           (= (- (length (ws-pending request)) (ws-frame-header-end request))
-              (ws-frame-length request)))
-      (progn
-        (setf (ws-body request) (substring (ws-pending request) (ws-frame-header-end request))
-              (ws-frame-state request) 'complete)
-        (ws--frame-retire request)
-        (ws--frame-decode request)
-        t)
-    (setf (ws-active request) nil)
-    nil))
+  (let ((frame (ws--frame-request-context request)))
+    ;; Legacy direct parser callers supply pending, without a socket/filter.
+    (unless (ws--frame-request-state frame)
+      (let ((input (ws-pending request)))
+        (setf (ws-pending request) "")
+        (ws--frame-append request input)))
+    (when (ws--frame-request-error frame)
+      (ws--frame-retire request)
+      (setf (ws--frame-request-state frame) 'retired)
+      (ws--frame-send request (ws--frame-request-error frame))
+      (throw 'close-connection nil))
+    (if (and (eq (ws--frame-request-state frame) 'body)
+             (= (- (length (ws-pending request)) (ws--frame-request-header-end frame))
+                (ws--frame-request-length frame)))
+        (progn
+          (setf (ws-body request) (substring (ws-pending request) (ws--frame-request-header-end frame))
+                (ws--frame-request-state frame) 'complete)
+          (ws--frame-retire request)
+          (ws--frame-decode request)
+          t)
+      (setf (ws-active request) nil)
+      nil)))
 
 (defun ws-request-target (request)
   "Return REQUEST's request-target exactly as received, or nil.
@@ -802,7 +819,8 @@ It is read from the request line that framing accepted, so it is nil
 until the complete head has been accepted and for a refused head.  No
 percent-decoding and no \"+\" mapping is applied.  The caller's match
 data is preserved."
-  (let ((line (ws-frame-request-line request)))
+  (let* ((message (ws--frame-request-message (ws--frame-request-context request)))
+         (line (and message (ws--frame-message-request-line message))))
     (when line
       (save-match-data
         ;; Match as framing does, whatever the caller's `case-fold-search'.
@@ -829,7 +847,8 @@ multipart body the parsed parts.  It is the same list that is appended
 to the header alist, not a copy, so nothing is parsed here.  It is nil
 until the complete request has been decoded and when the media type is
 not a form type.  The request owns the list; callers must not modify it."
-  (ws-frame-form-params request))
+  (let ((message (ws--frame-request-message (ws--frame-request-context request))))
+    (when message (ws--frame-message-form-params message))))
 
 (defun ws-call-handler (request handlers)
   (catch 'matched-handler

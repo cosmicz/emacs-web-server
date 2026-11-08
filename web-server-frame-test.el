@@ -638,6 +638,7 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
           (ws-frame-test--rejected-client
            server (concat (ws-frame-test--header "abc") "abc")))
         (should (= 0 allocations))
+        (should (integerp registry-before))
         (should (equal registry-before (ws-frame-test--registry-count server)))
         (should (equal before (ws-requests server)))
         (should (process-live-p (car peer)))
@@ -776,10 +777,22 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
         (should (= 1 (ws-frame-test--get state :calls)))))))
 
 ;;; cap-extra-controls.el --- Admission specification delta -*- lexical-binding: t; -*-
+(defun ws-frame-test--registry (server)
+  "Return the real registry; fail loudly if neither representation exists."
+  (let* ((slot (cond ((slot-exists-p server 'frame-connections) 'frame-connections)
+                     ((slot-exists-p server 'ws--frame-context) 'ws--frame-context)
+                     (t (ert-fail "No framing registry representation"))))
+         (value (slot-value server slot))
+         (table (if (eq slot 'frame-connections) value
+                  (ws--frame-server-connections value))))
+    (should (hash-table-p table))
+    table))
+
 (defun ws-frame-test--registry-count (server)
-  "Return the real proposed registry size, nil when the baseline lacks it."
-  (when (slot-exists-p server 'frame-connections)
-    (hash-table-count (slot-value server 'frame-connections))))
+  "Return a witnessed integer registry size for base and private contexts."
+  (let ((count (hash-table-count (ws-frame-test--registry server))))
+    (should (integerp count))
+    count))
 
 (ert-deftest ws/frame-default-pending-bound-derived ()
   ;; Fallback values alone prove nothing.  All four settings must originate
@@ -855,6 +868,7 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
           ;; nil operation externally.  This is not an external-effect claim.
           (should-not nil-process-calls)
           (should (process-live-p peer))
+          (should (integerp count))
           (should (equal count (ws-frame-test--registry-count server)))
           (should (equal buffers (buffer-list)))
           (should-not (plist-member (process-plist (ws-process server)) :log-buffer))
@@ -921,8 +935,7 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
                               (not (eq proc (ws-process server))))
                      (cl-incf injected)
                      (setq registered-at-failure
-                           (and (slot-exists-p server 'frame-connections)
-                                (gethash proc (slot-value server 'frame-connections))))
+                           (gethash proc (ws-frame-test--registry server)))
                      (error "6kzz injected framing-sentinel installation error"))
                    (funcall original proc sentinel))))
         (setq escaped
@@ -957,7 +970,7 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
                          (when (and (eq proc (cdr a)) (not reentered))
                            (setq reentered t)
                            (setq removed-first
-                                 (not (gethash proc (slot-value server 'frame-connections))))
+                                 (not (gethash proc (ws-frame-test--registry server))))
                            ;; Reproduce a nested accept during status_notify.
                            (setq d (car (ws-frame-test--zero-client server))))
                          (funcall original proc))))

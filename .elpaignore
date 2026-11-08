@@ -6,6 +6,7 @@ README
 stuff
 web-server-test.el
 web-server-lifetime-test.el
+web-server-frame-state-test.el
 
 ## Ignorable documentation files
 doc/dir

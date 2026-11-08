@@ -1,7 +1,7 @@
                            Emacs Web Server
 
     Copyright (C) 2026 OC (cosmicz@github)
-    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure. Also document DISPATCHED REQUEST LIFETIME.
+    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure. Also document DISPATCHED REQUEST LIFETIME. Document private framing ownership and removal of unsupported accessors.
 
 DESCRIPTION
     A web server in Emacs running handlers written in Emacs Lisp.
@@ -19,6 +19,20 @@ STATUS
     network process primitives, so it should be fairly robust.
 
     [1]  http://eschulte.github.io/emacs-web-server/benchmark/
+
+
+PRIVATE FRAMING STATE
+    The unsupported public-looking ws-frame-* slot accessor functions have
+    been removed, with no compatibility aliases. Code that used those
+    internals must migrate; live migration of already loaded old objects
+    is not provided. The supported ws-request-target, ws-request-raw-query
+    and ws-request-form-params getters and framing configuration remain.
+    Internal ws--frame-* names are private by convention, not Lisp-enforced
+    secrecy. Server admission/sentinel entries are separate from retained
+    request framing and accepted-message records. Limits are validated once
+    and shared without mutation. Zero-input expiry is admission + timeout;
+    after first input the request owns one fixed first-input + timeout
+    deadline, read by both input refusal and lazy admission reclaim.
 
 
 REQUEST FRAMING

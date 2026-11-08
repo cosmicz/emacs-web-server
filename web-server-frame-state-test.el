@@ -1,0 +1,236 @@
+;;; web-server-frame-state-test.el --- Private framing ownership -*- lexical-binding: t; -*-
+;; Copyright (C) 2026 OC (cosmicz@github)
+;; SPDX-License-Identifier: GPL-3.0-or-later
+;;; Commentary:
+;; Representation assertions supplement unchanged wire/lifetime controls.
+;; Explicit dual paths permit test-first replay without hiding missing state.
+;;; Code:
+(require 'web-server-frame-test)
+
+(defun ws-state-test--forms ()
+  "Read production source forms without loading a second implementation."
+  (with-temp-buffer
+    (insert-file-contents (concat (file-name-sans-extension
+                                  (symbol-file 'ws-start 'defun)) ".el"))
+    (goto-char (point-min))
+    (let (forms)
+      (condition-case nil
+          (while t (push (read (current-buffer)) forms))
+        (end-of-file (nreverse forms))))))
+
+(defun ws-state-test--definition (kind name)
+  (cl-find-if (lambda (form)
+                (and (eq (car-safe form) kind)
+                     (eq (if (consp (cadr form)) (caadr form) (cadr form)) name)))
+              (ws-state-test--forms)))
+
+(defun ws-state-test--fields (name)
+  (let ((definition (ws-state-test--definition 'cl-defstruct name)))
+    (should definition)
+    (mapcar (lambda (field) (if (consp field) (car field) field))
+            (cl-remove-if #'stringp (cddr definition)))))
+
+(defun ws-state-test--value (request field)
+  "Observe FIELD through an explicit old or private request representation."
+  (let ((old (intern (concat "frame-" (symbol-name field)))))
+    (if (slot-exists-p request old)
+        (slot-value request old)
+      (should (slot-exists-p request 'ws--frame-context))
+      (funcall (intern (concat "ws--frame-request-" (symbol-name field)))
+               (ws--frame-request-context request)))))
+
+(defun ws-state-test--positional-limits ()
+  "Find direct positional reads of limits, excluding unrelated tuples."
+  (let (found)
+    (cl-labels ((limits-p (value)
+                  (or (memq value '(settings limits))
+                      (and (consp value)
+                           (memq (car value) '(ws-frame-limits ws-frame-settings
+                                               ws--frame-request-limits
+                                               ws--frame-server-limits)))))
+                (walk (form)
+                  (when (consp form)
+                    (when (and (memq (car form) '(car cadr elt aref nth))
+                               (limits-p (if (eq (car form) 'nth) (nth 2 form) (cadr form))))
+                      (push form found))
+                    (walk (car form))
+                    (walk (cdr form)))))
+      (mapc #'walk (ws-state-test--forms)))
+    (nreverse found)))
+
+(ert-deftest ws/state-private-class-slots ()
+  (dolist (class '(ws-server ws-request))
+    (let* ((definition (ws-state-test--definition 'defclass class))
+           (names (mapcar #'car (nth 3 definition))))
+      (should (equal names (mapcar #'eieio-slot-descriptor-name
+                                  (eieio-class-slots class))))
+      (should (memq 'ws--frame-context names))
+      (should (= 1 (cl-count 'ws--frame-context names)))
+      (should-not (cl-find-if (lambda (name) (string-prefix-p "frame-" (symbol-name name))) names)))))
+
+(ert-deftest ws/state-no-public-frame-generics ()
+  (dolist (name '(settings connections sequence stopped state limits error
+                          header-end length request-line fields form-params deadline))
+    (let ((symbol (intern (concat "ws-frame-" (symbol-name name)))))
+      (should-not (fboundp symbol))
+      (should-not (get symbol 'gv-expander)))))
+
+(ert-deftest ws/state-entry-has-no-deadline ()
+  (should (equal '(admitted request prior sentinel order)
+                 (ws-state-test--fields 'ws--frame-entry)))
+  (should-not (fboundp 'ws--frame-entry-deadline)))
+
+(ert-deftest ws/state-named-records ()
+  (dolist (pair '((ws--frame-server limits connections sequence stopped)
+                  (ws--frame-request state limits error header-end length deadline message)
+                  (ws--frame-message request-line fields form-params)
+                  (ws--frame-limits body header timeout incomplete-cap)))
+    (should (equal (cdr pair) (ws-state-test--fields (car pair))))))
+
+(ert-deftest ws/state-no-positional-limits ()
+  (should-not (ws-state-test--positional-limits)))
+
+(ert-deftest ws/state-frozen-limits-read-only ()
+  (let ((definition (ws-state-test--definition 'cl-defstruct 'ws--frame-limits)))
+    (should definition)
+    (dolist (field (cl-remove-if #'stringp (cddr definition)))
+      (should (eq t (plist-get (cddr field) :read-only))))))
+
+(ert-deftest ws/state-fresh-contexts ()
+  (should (fboundp 'ws--frame-server-context))
+  (should (fboundp 'ws--frame-request-context))
+  (let* ((a (make-instance 'ws-server)) (b (make-instance 'ws-server))
+         (ra (make-instance 'ws-request)) (rb (make-instance 'ws-request))
+         (ca (ws--frame-server-context a)) (cb (ws--frame-server-context b)))
+    (should-not (eq ca cb))
+    (should-not (eq (ws--frame-request-context ra) (ws--frame-request-context rb)))
+    (puthash 'probe t (ws--frame-server-connections ca))
+    (should (= 0 (hash-table-count (ws--frame-server-connections cb))))))
+
+(ert-deftest ws/state-registry-observation-is-integer ()
+  (ws-frame-test--with state server
+    (let ((before (ws-frame-test--registry-count server)))
+      (should (integerp before))
+      (should (= 0 before))
+      (ws-frame-test--zero-client server)
+      (should (= (1+ before) (ws-frame-test--registry-count server))))))
+
+(ert-deftest ws/state-frozen-shared-limits ()
+  (should (fboundp 'ws--frame-server-context))
+  (ws-frame-test--with state server
+    (let* ((limits (ws--frame-server-limits (ws--frame-server-context server)))
+           (client (ws-test-deferred--client (ws-test-deferred--port server))))
+      (let ((ws-request-body-limit -1) (ws-request-header-limit nil))
+        (ws-frame-test--feed client (concat (ws-frame-test--header "abc") "a") state)
+        (let ((request (ws-frame-test--get state :seen-request)))
+          (should (eq limits (ws-state-test--value request 'limits)))
+          (ws-frame-test--feed client "bc" state)
+          (should (eq limits (ws-state-test--value request 'limits)))))
+      (ws-frame-test--status client 200))))
+
+(ert-deftest ws/state-pure-parser-no-clock ()
+  (let ((request (make-instance 'ws-request)))
+    (cl-letf (((symbol-function 'ws--frame-now) (lambda () (ert-fail "Pure parser consulted clock"))))
+      (ws--frame-append request (concat (ws-frame-test--header "abc") "abc"))
+      (should (ws-parse-request request))
+      (should-not (ws-state-test--value request 'deadline))
+      (should (equal "abc" (ws-body request))))))
+
+(ert-deftest ws/state-local-process-fixed-clock ()
+  (let ((now 40) (ws-request-framing-timeout 10)
+        (proc (make-pipe-process :name "state-local" :noquery t)))
+    (unwind-protect
+        (let ((request (make-instance 'ws-request :process proc)))
+          (cl-letf (((symbol-function 'ws--frame-now) (lambda () now)))
+            (ws--frame-append request "POST / HTTP/1.1\r\n")
+            (should (numberp (ws-state-test--value request 'deadline)))
+            (should (= 50 (ws-state-test--value request 'deadline)))
+            (setq now 49)
+            (let ((ws-request-framing-timeout -1))
+              (ws--frame-append request "Host: x\r\n"))
+            (should (= 50 (ws-state-test--value request 'deadline)))
+            (setq now 50)
+            (ws--frame-append request "\r\n")
+            (should (= 408 (ws-state-test--value request 'error)))))
+      (delete-process proc))))
+
+(ert-deftest ws/state-admission-and-first-input-clocks ()
+  (let ((now 0) (ws-request-framing-timeout 10))
+    (cl-letf (((symbol-function 'ws--frame-now) (lambda () now)))
+      (ws-frame-test--with state server
+        (let* ((peer (ws-frame-test--zero-client server)) (proc (cdr peer)))
+          (setq now 100)
+          ;; No intervening admission: old A+T does not reject first input.
+          (ws-filter proc (concat (ws-frame-test--header "abc") "a"))
+          (let ((request (ws-frame-test--get state :seen-request)))
+            (should request)
+            (should (= 110 (ws-state-test--value request 'deadline)))
+            (should-not (ws-state-test--value request 'error))
+            (setq now 109)
+            (ws--frame-reclaim server)
+            (should (process-live-p proc))
+            (should (= 1 (ws-frame-test--registry-count server)))
+            (ws-filter proc "b")
+            (should (= 110 (ws-state-test--value request 'deadline)))
+            (setq now 110)
+            (ws--frame-reclaim server)
+            (should-not (process-live-p proc))
+            (should (= 0 (ws-frame-test--registry-count server)))))))))
+
+(ert-deftest ws/state-zero-input-admission-boundary ()
+  (let ((now 20) (ws-request-framing-timeout 10))
+    (cl-letf (((symbol-function 'ws--frame-now) (lambda () now)))
+      (ws-frame-test--with state server
+        (let ((peer (ws-frame-test--zero-client server)))
+          (should-not (ws-requests server))
+          (setq now 29)
+          (ws--frame-reclaim server)
+          (should (process-live-p (cdr peer)))
+          (setq now 30)
+          (ws--frame-reclaim server)
+          (should-not (process-live-p (cdr peer)))
+          (should (= 0 (ws-frame-test--registry-count server))))))))
+
+(ert-deftest ws/state-staged-getters-are-pure-and-forms-borrowed ()
+  (let ((request (make-instance 'ws-request)))
+    (cl-letf (((symbol-function 'ws--frame-settings) (lambda () (ert-fail "Getter captured settings")))
+              ((symbol-function 'ws-parse-request) (lambda (_) (ert-fail "Getter parsed"))))
+      (should-not (ws-request-target request))
+      (should-not (ws-request-raw-query request))
+      (should-not (ws-request-form-params request)))
+    (ws--frame-append request "POST /stage?q=raw+%20 HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 7\r\n\r\na=1")
+    (should (equal "/stage?q=raw+%20" (ws-request-target request)))
+    (should (equal "q=raw+%20" (ws-request-raw-query request)))
+    (should-not (ws-request-form-params request))
+    (ws--frame-append request "&b=2")
+    (should (ws-parse-request request))
+    (let ((forms (ws-request-form-params request)))
+      (should (equal '(("b" . "2") ("a" . "1")) forms))
+      (should (eq forms (member (car forms) (ws-headers request)))))))
+
+(ert-deftest ws/state-metadata-survives-release-and-stop ()
+  (ws-frame-test--with state server
+    (let* ((peer (ws-frame-test--zero-client server))
+           (request (make-instance 'ws-request :process (cdr peer))))
+      (push request (ws-requests server))
+      (ws--frame-append request "POST /kept?q=1 HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=1")
+      (let ((decode (symbol-function 'ws--frame-decode)) (decodes 0))
+        (cl-letf (((symbol-function 'ws--frame-decode)
+                   (lambda (value)
+                     (cl-incf decodes)
+                     ;; Retirement precedes decoding: accepted HEAD survives it.
+                     (should (equal "/kept?q=1" (ws-request-target value)))
+                     (funcall decode value))))
+          (should (ws-parse-request request)))
+        (should (= 1 decodes)))
+      (should (= 0 (ws-frame-test--registry-count server)))
+      (let ((forms (ws-request-form-params request)))
+        (should forms)
+        (should (eq forms (member (car forms) (ws-headers request))))
+        (should (equal "/kept?q=1" (ws-request-target request)))
+        (ws-stop server)
+        (should (equal "/kept?q=1" (ws-request-target request)))
+        (should (eq forms (ws-request-form-params request)))))))
+
+(provide 'web-server-frame-state-test)
+;;; web-server-frame-state-test.el ends here
