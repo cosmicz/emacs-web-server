@@ -1,7 +1,7 @@
                            Emacs Web Server
 
     Copyright (C) 2026 OC (cosmicz@github)
-    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure. Also document DISPATCHED REQUEST LIFETIME. Document private framing ownership and removal of unsupported accessors.
+    Modified by OC (cosmicz@github), 2026: Document complete-body framing, finite admission limits, lazy expiry, and bind exposure. Also document DISPATCHED REQUEST LIFETIME.
 
 DESCRIPTION
     A web server in Emacs running handlers written in Emacs Lisp.
@@ -19,20 +19,6 @@ STATUS
     network process primitives, so it should be fairly robust.
 
     [1]  http://eschulte.github.io/emacs-web-server/benchmark/
-
-
-PRIVATE FRAMING STATE
-    The unsupported public-looking ws-frame-* slot accessor functions have
-    been removed, with no compatibility aliases. Code that used those
-    internals must migrate; live migration of already loaded old objects
-    is not provided. The supported ws-request-target, ws-request-raw-query
-    and ws-request-form-params getters and framing configuration remain.
-    Internal ws--frame-* names are private by convention, not Lisp-enforced
-    secrecy. Server admission/sentinel entries are separate from retained
-    request framing and accepted-message records. Limits are validated once
-    and shared without mutation. Zero-input expiry is admission + timeout;
-    after first input the request owns one fixed first-input + timeout
-    deadline, read by both input refusal and lazy admission reclaim.
 
 
 REQUEST FRAMING
@@ -66,13 +52,13 @@ REQUEST FRAMING
     further input/admission, quiet entries can remain until EOF or stop.
     Unexpired, dispatched and deferred responses are never pressure-evicted.
 
-    Clime defaults to 127.0.0.1:8080 and explicitly passes :host.  A wider
-    :host exposes this pre-authentication framing/refusal path more widely;
-    authentication does not reserve framing capacity.  Choose binds and
-    limits for the intended exposure.  EOF, refusal, completion and stop
-    release framing ownership; optional logging failure does not revoke a
-    successful admission.  Caller sentinels keep their native accept/close
-    events, including deleted then open-on-dead for a cap-refused accept.
+    The :host setting controls exposure of this pre-authentication
+    framing/refusal path; authentication does not reserve framing capacity.
+    Choose binds and limits for the intended exposure. EOF, refusal,
+    completion and stop release framing ownership; optional logging failure
+    does not revoke a successful admission. Caller sentinels keep their native
+    accept/close events, including deleted then open-on-dead for a cap-refused
+    accept.
 
     Complete-body framing reimplements the idea discussed in upstream PR #31
     (dickmao) for all content types and octets; that patch is not imported.
