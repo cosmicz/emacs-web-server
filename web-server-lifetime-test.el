@@ -35,38 +35,39 @@
   "Run BODY on an ephemeral loopback SERVER using HANDLER.
 Remember dispatched processes before WebSocket replaces their plist."
   (declare (indent 2))
-  `(let ((,server nil) (ws-life-test--owned nil)
-         (ws-test-deferred--clients nil)
-         (timers-before (append timer-list timer-idle-list nil)))
-     (setq ,server
-           (ws-start (lambda (request)
-                       (cl-pushnew (ws-process request) ws-life-test--owned)
-                       (funcall ,handler request))
-                     0 nil :host "127.0.0.1"))
-     (unwind-protect (progn ,@body)
-       (let ((owned (delete-dups
-                     (append ws-life-test--owned
-                             (ws-life-test--connections ,server)))))
-         ;; Ordinary fixture cleanup; assertions in BODY precede this stop.
-         (dolist (client ws-test-deferred--clients)
-           (when (process-live-p client) (delete-process client)))
-         (when (memq ,server ws-servers) (ws-stop ,server))
-         (let* ((timers (ws-life-test--timers timers-before))
-                (live (cl-remove-if-not #'process-live-p owned))
-                (clients (cl-remove-if-not #'process-live-p ws-test-deferred--clients))
-                (listener (process-live-p (ws-process ,server))))
-           (push (list :requests (length (ws-requests ,server))
-                       :registry (ws-frame-test--registry-count ,server)
-                       :live-accepted (length live) :live-clients (length clients)
-                       :listener-live (if listener t :json-false)
-                       :new-timers (length timers)
-                       :forced-processes (+ (length live) (length clients)
-                                            (if listener 1 0)))
-                 ws-life-test--census)
-           ;; Never hide these interventions in the recorded row.
-           (dolist (proc (append live clients (when listener (list (ws-process ,server)))))
-             (ignore-errors (delete-process proc)))
-           (mapc #'cancel-timer timers))))))
+  `(ws-test--without-subr-trampolines
+    (let ((,server nil) (ws-life-test--owned nil)
+           (ws-test-deferred--clients nil)
+           (timers-before (append timer-list timer-idle-list nil)))
+       (setq ,server
+             (ws-start (lambda (request)
+                         (cl-pushnew (ws-process request) ws-life-test--owned)
+                         (funcall ,handler request))
+                       0 nil :host "127.0.0.1"))
+       (unwind-protect (progn ,@body)
+         (let ((owned (delete-dups
+                       (append ws-life-test--owned
+                               (ws-life-test--connections ,server)))))
+           ;; Ordinary fixture cleanup; assertions in BODY precede this stop.
+           (dolist (client ws-test-deferred--clients)
+             (when (process-live-p client) (delete-process client)))
+           (when (memq ,server ws-servers) (ws-stop ,server))
+           (let* ((timers (ws-life-test--timers timers-before))
+                  (live (cl-remove-if-not #'process-live-p owned))
+                  (clients (cl-remove-if-not #'process-live-p ws-test-deferred--clients))
+                  (listener (process-live-p (ws-process ,server))))
+             (push (list :requests (length (ws-requests ,server))
+                         :registry (ws-frame-test--registry-count ,server)
+                         :live-accepted (length live) :live-clients (length clients)
+                         :listener-live (if listener t :json-false)
+                         :new-timers (length timers)
+                         :forced-processes (+ (length live) (length clients)
+                                              (if listener 1 0)))
+                   ws-life-test--census)
+             ;; Never hide these interventions in the recorded row.
+             (dolist (proc (append live clients (when listener (list (ws-process ,server)))))
+               (ignore-errors (delete-process proc)))
+             (mapc #'cancel-timer timers)))))))
 
 (defun ws-life-test--wait (predicate)
   "Service events until PREDICATE, with a bounded real-time deadline."

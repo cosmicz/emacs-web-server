@@ -35,44 +35,45 @@ all other new timers, including closures with nil args, remain in the census.")
 (defmacro ws-frame-test--with (state server &rest body)
   "Own a real server, clients, instrumentation and every newly made timer."
   (declare (indent 2))
-  `(let* ((,state (list nil)) (,server nil)
-          (ws-test-deferred--clients nil)
-          (timers-before (append timer-list timer-idle-list nil))
-          (original-filter (symbol-function 'ws-filter))
-          (original-parse (symbol-function 'ws-parse-request)))
-     (unwind-protect
-         (cl-letf (((symbol-function 'ws-filter)
-                    (lambda (proc bytes)
-                      (let ((depth (or (ws-frame-test--get ,state :filter-depth) 0)))
-                        (ws-frame-test--put ,state :filter-depth (1+ depth))
-                        (ws-frame-test--put ,state :filter-thread (current-thread))
-                        (unwind-protect (funcall original-filter proc bytes)
-                          (when (eq ,server (process-get proc :server))
-                            (ws-frame-test--put
-                             ,state :received
-                             (+ (or (ws-frame-test--get ,state :received) 0)
-                                (string-bytes bytes))))
-                          (ws-frame-test--put ,state :filter-depth depth)))))
-                   ((symbol-function 'ws-parse-request)
-                    (lambda (request)
-                      (when (eq ,server (process-get (ws-process request) :server))
-                        (ws-frame-test--put
-                         ,state :max-pending
-                         (max (or (ws-frame-test--get ,state :max-pending) 0)
-                              (string-bytes (ws-pending request))))
-                        (ws-frame-test--put ,state :seen-request request))
-                      (funcall original-parse request))))
-           (setq ,server (apply #'ws-start (ws-frame-test--handler ,state) 0
-                                ws-frame-test--log-buffer :host "127.0.0.1"
-                                ws-frame-test--network-args))
-           (ignore timers-before) ; most controls do not inspect timer state
-           ,@body)
-       (mapc (lambda (p) (when (process-live-p p) (delete-process p)))
-             ws-test-deferred--clients)
-       (when (memq ,server ws-servers) (ws-stop ,server))
-       ;; The per-test observer records timer/socket/registry leaks BEFORE
-       ;; its forced safety cleanup.  Do not conceal them in this fixture.
-       nil)))
+  `(ws-test--without-subr-trampolines
+    (let* ((,state (list nil)) (,server nil)
+            (ws-test-deferred--clients nil)
+            (timers-before (append timer-list timer-idle-list nil))
+            (original-filter (symbol-function 'ws-filter))
+            (original-parse (symbol-function 'ws-parse-request)))
+       (unwind-protect
+           (cl-letf (((symbol-function 'ws-filter)
+                      (lambda (proc bytes)
+                        (let ((depth (or (ws-frame-test--get ,state :filter-depth) 0)))
+                          (ws-frame-test--put ,state :filter-depth (1+ depth))
+                          (ws-frame-test--put ,state :filter-thread (current-thread))
+                          (unwind-protect (funcall original-filter proc bytes)
+                            (when (eq ,server (process-get proc :server))
+                              (ws-frame-test--put
+                               ,state :received
+                               (+ (or (ws-frame-test--get ,state :received) 0)
+                                  (string-bytes bytes))))
+                            (ws-frame-test--put ,state :filter-depth depth)))))
+                     ((symbol-function 'ws-parse-request)
+                      (lambda (request)
+                        (when (eq ,server (process-get (ws-process request) :server))
+                          (ws-frame-test--put
+                           ,state :max-pending
+                           (max (or (ws-frame-test--get ,state :max-pending) 0)
+                                (string-bytes (ws-pending request))))
+                          (ws-frame-test--put ,state :seen-request request))
+                        (funcall original-parse request))))
+             (setq ,server (apply #'ws-start (ws-frame-test--handler ,state) 0
+                                  ws-frame-test--log-buffer :host "127.0.0.1"
+                                  ws-frame-test--network-args))
+             (ignore timers-before) ; most controls do not inspect timer state
+             ,@body)
+         (mapc (lambda (p) (when (process-live-p p) (delete-process p)))
+               ws-test-deferred--clients)
+         (when (memq ,server ws-servers) (ws-stop ,server))
+         ;; The per-test observer records timer/socket/registry leaks BEFORE
+         ;; its forced safety cleanup.  Do not conceal them in this fixture.
+         nil))))
 
 (defun ws-frame-test--header (body &optional content-type extra)
   (concat "POST /frame HTTP/1.1\r\nHost: localhost\r\n"
@@ -314,20 +315,21 @@ an optional raw-target substring; the slack covers bounded reply overhead."
                (cap-fraction ws-request-incomplete-limit 1.5)
                (cap-string ws-request-incomplete-limit "unlimited")))
   (eval `(ert-deftest ,(intern (format "ws/frame-setting-%s" (car row))) ()
-           (let ((network-calls 0) (server nil) (condition nil)
-                 (original-network (symbol-function 'make-network-process)))
-             (cl-letf (((symbol-function 'make-network-process)
-                        (lambda (&rest arguments) (cl-incf network-calls)
-                          (apply original-network arguments))))
-               (unwind-protect
-                   (let ((,(cadr row) ,(caddr row)))
-                     (setq condition
-                           (condition-case error
-                               (progn (setq server (ws-start #'ignore 0 nil :host "127.0.0.1")) nil)
-                             (error error)))
-                     (should (eq 'ws-request-setting-error (car-safe condition)))
-                     (should (= 0 network-calls)))
-                 (when server (ws-stop server)))))) t))
+           (ws-test--without-subr-trampolines
+             (let ((network-calls 0) (server nil) (condition nil)
+                   (original-network (symbol-function 'make-network-process)))
+               (cl-letf (((symbol-function 'make-network-process)
+                          (lambda (&rest arguments) (cl-incf network-calls)
+                            (apply original-network arguments))))
+                 (unwind-protect
+                     (let ((,(cadr row) ,(caddr row)))
+                       (setq condition
+                             (condition-case error
+                                 (progn (setq server (ws-start #'ignore 0 nil :host "127.0.0.1")) nil)
+                               (error error)))
+                       (should (eq 'ws-request-setting-error (car-safe condition)))
+                       (should (= 0 network-calls)))
+                   (when server (ws-stop server))))))) t))
 
 (ert-deftest ws/frame-missing-length-body-is-unframed ()
   (ws-frame-test--refused "" 400 "close-delimited-body"))
@@ -896,33 +898,35 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
 
 (ert-deftest ws/frame-stop-fences-reentrant-admission ()
   "Replay an accept callback delayed until after stop: it must close the peer."
-  (let ((original-network (symbol-function 'make-network-process))
-        (late nil) (accepts 0) (ws-request-incomplete-limit 2))
-    (cl-letf (((symbol-function 'make-network-process)
-               (lambda (&rest arguments)
-                 (let ((callback (plist-get arguments :log)))
-                   (when callback
-                     (setq arguments
-                           (plist-put arguments :log
-                                      (lambda (listener client event)
-                                        (if (and client (= 2 (cl-incf accepts)))
-                                            (setq late (list callback listener client event))
-                                          (funcall callback listener client event))))))
-                   (apply original-network arguments)))))
-      (ws-frame-test--with state server
-        (let ((a (car (ws-frame-test--zero-client server)))
-              (b (car (ws-frame-test--zero-client server))))
-          (should late)
-          (ws-stop server)
-          (apply (car late) (cdr late))
-          (ws-frame-test--closed a)
-          (ws-frame-test--closed b)
-          (should-not (ws-requests server))
-          (should (equal 0 (ws-frame-test--registry-count server)))
-          (ws-frame-test--no-call state))))))
+  (ws-test--without-subr-trampolines
+    (let ((original-network (symbol-function 'make-network-process))
+          (late nil) (accepts 0) (ws-request-incomplete-limit 2))
+      (cl-letf (((symbol-function 'make-network-process)
+                 (lambda (&rest arguments)
+                   (let ((callback (plist-get arguments :log)))
+                     (when callback
+                       (setq arguments
+                             (plist-put arguments :log
+                                        (lambda (listener client event)
+                                          (if (and client (= 2 (cl-incf accepts)))
+                                              (setq late (list callback listener client event))
+                                            (funcall callback listener client event))))))
+                     (apply original-network arguments)))))
+        (ws-frame-test--with state server
+          (let ((a (car (ws-frame-test--zero-client server)))
+                (b (car (ws-frame-test--zero-client server))))
+            (should late)
+            (ws-stop server)
+            (apply (car late) (cdr late))
+            (ws-frame-test--closed a)
+            (ws-frame-test--closed b)
+            (should-not (ws-requests server))
+            (should (equal 0 (ws-frame-test--registry-count server)))
+            (ws-frame-test--no-call state)))))))
 
 
 ;;; admission-reentry-controls.el --- P1-P3 admission contract -*- lexical-binding: t; -*-
+
 (ert-deftest ws/frame-admission-error-is-contained-and-fail-closed ()
   "One failed sentinel install after reservation cannot escape the waiter."
   (ws-frame-test--with state server
@@ -1115,5 +1119,39 @@ See RFC9110 10.1.4/5.6.4 and RFC9112 6.1; none enters the handler."
             (should (process-live-p c))
             (should (equal 1 (ws-frame-test--registry-count server)))
             (ws-frame-test--no-call state)))))))
+
+;;; Local primitive-interception policy contracts.
+
+(ert-deftest ws/trampoline-binding-restores-on-exit ()
+  "The scope changes the real dynamic value and restores its caller on exit."
+  (should (macrop 'ws-test--without-subr-trampolines))
+  (defvar native-comp-enable-subr-trampolines)
+  (let ((native-comp-enable-subr-trampolines t))
+    (should-not
+     (eval '(ws-test--without-subr-trampolines
+              (symbol-value 'native-comp-enable-subr-trampolines)) t))
+    (should (eq t (symbol-value 'native-comp-enable-subr-trampolines)))
+    (should
+     (eq :exited
+         (catch 'ws-test--scope-exit
+           (eval '(ws-test--without-subr-trampolines
+                    (throw 'ws-test--scope-exit :exited)) t))))
+    (should (eq t (symbol-value 'native-comp-enable-subr-trampolines)))))
+
+(ert-deftest ws/trampoline-binding-guard-is-active ()
+  "The guard fails even if an interception's dynamic binding is bypassed."
+  (should (macrop 'ws-test--without-subr-trampolines))
+  (defvar native-comp-enable-subr-trampolines)
+  (let* ((native-comp-enable-subr-trampolines t)
+         (expansion (macroexpand '(ws-test--without-subr-trampolines :body-ran))))
+    (should (eq 'progn (car-safe expansion)))
+    (should (equal '(defvar native-comp-enable-subr-trampolines)
+                   (nth 1 expansion)))
+    (setq expansion (nth 2 expansion))
+    (should (eq 'let (car-safe expansion)))
+    ;; Deliberately drop only the binding.  With a constant body there is
+    ;; no other operation that could provide the expected assertion failure.
+    (should-error (eval (cons 'progn (cddr expansion)) t) :type 'ert-test-failed)
+    (should (eq t (symbol-value 'native-comp-enable-subr-trampolines)))))
 
 (provide 'web-server-frame-test)

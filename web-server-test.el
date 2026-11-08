@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2013-2021  Free Software Foundation, Inc.
 ;; Copyright (C) 2026 OC (cosmicz@github)
-;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target, raw query and form-params accessors. Observe framing errors through the private request context.
+;; Modified by OC (cosmicz@github), 2026: Test deferred replies and accept logging; correct fixture Content-Lengths; bound curl completion and check gzip transfer coding; test the raw request-target, raw query and form-params accessors. Observe framing errors through the private request context. Guard primitive interception with asserted local trampoline suppression.
 
 ;; Author: Eric Schulte <schulte.eric@gmail.com>
 
@@ -706,6 +706,18 @@ for FILE, so what it writes is ordered after the exit."
 ;; the helper's calls from Lisp still see the advice.
 (defvar native-comp-enable-subr-trampolines)
 
+(defmacro ws-test--without-subr-trampolines (&rest body)
+  "Run BODY with asserted test-local suppression of native trampolines.
+Primitive interception installs must see the dynamic binding, including
+on builds where the variable has no global value.  Keep the caller's
+policy unchanged when BODY returns or exits nonlocally."
+  (declare (indent 0))
+  `(progn
+     (defvar native-comp-enable-subr-trampolines)
+     (let ((native-comp-enable-subr-trampolines nil))
+       (should-not (symbol-value 'native-comp-enable-subr-trampolines))
+       ,@body)))
+
 (defvar ws-test-curl--replaced nil
   "Curl processes whose sentinel `ws-test-curl--without-sentinel' replaced.")
 
@@ -730,11 +742,11 @@ bound turns that into a failure instead of a hang."
           (ws-send process "ok")))
     (let ((ws-test-curl--replaced nil)
           result)
-      (let ((native-comp-enable-subr-trampolines nil))
-        (advice-add 'make-process :around #'ws-test-curl--without-sentinel))
-      (unwind-protect
-          (setq result (ws-test-curl--bounded 3 (ws-test-curl-to-string "")))
-        (advice-remove 'make-process #'ws-test-curl--without-sentinel))
+      (ws-test--without-subr-trampolines
+        (advice-add 'make-process :around #'ws-test-curl--without-sentinel)
+        (unwind-protect
+            (setq result (ws-test-curl--bounded 3 (ws-test-curl-to-string "")))
+          (advice-remove 'make-process #'ws-test-curl--without-sentinel)))
       (should (= 1 (length ws-test-curl--replaced)))
       (let ((proc (car ws-test-curl--replaced)))
         (message "ws/curl-helper-completes-without-sentinel: %S %S %S"
@@ -898,12 +910,13 @@ is registered for cleanup by `ws-test-deferred--with'."
 Every client opened through `ws-test-deferred--client' and the server
 are cleaned up even when an assertion fails."
   (declare (indent 2))
-  `(let ((ws-test-deferred--clients nil)
-         (,var (ws-start ,handler 0)))
-     (unwind-protect (progn ,@body)
-       (mapc (lambda (p) (when (process-live-p p) (delete-process p)))
-             ws-test-deferred--clients)
-       (when (memq ,var ws-servers) (ws-stop ,var)))))
+  `(ws-test--without-subr-trampolines
+    (let ((ws-test-deferred--clients nil)
+           (,var (ws-start ,handler 0)))
+       (unwind-protect (progn ,@body)
+         (mapc (lambda (p) (when (process-live-p p) (delete-process p)))
+               ws-test-deferred--clients)
+         (when (memq ,var ws-servers) (ws-stop ,var))))))
 
 (defun ws-test-deferred--note (state key value)
   "Set KEY to VALUE in the plist held in the car of STATE."
